@@ -226,7 +226,7 @@ def longitudinal_collate(batch: list) -> dict:
 # ------------------------------------------------------------------ #
 
 def get_dataloaders(json_path: str,
-                    target_shape=(192, 192, 192),
+                    target_shape=(160, 64, 64),
                     batch_size: int = 2,
                     num_workers: int = 4,
                     oversample_rate: float = 0.33):
