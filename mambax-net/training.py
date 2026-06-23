@@ -25,6 +25,7 @@ import wandb
 
 from mambaxnet import load_nnunet_weights, MambaXNet
 from load_dataset import get_dataloaders
+from wandb_logging import log_validation_images
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -270,6 +271,7 @@ def main():
         val_loss, val_dice = validate(
             model, val_loader, criterion, device, args.n_classes
         )
+        log_validation_images(model, val_loader, device, global_step)
 
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
