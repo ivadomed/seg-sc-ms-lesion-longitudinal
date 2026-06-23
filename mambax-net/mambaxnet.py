@@ -14,25 +14,8 @@ sys.path.insert(0, root_path)
 from mcam import MCAM
 
 
-def load_nnunet_weights(model_folder):
-    """
-    This function loads the weights of the pretrained ResEncoderUNet and returns the model.
-    """
-    # Build the paths to the checkpoint and json config file based on the provided model folder path
-    checkpoint_path = f'{model_folder}/fold_0/checkpoint_best.pth'
-    json_config_path = f'{model_folder}/plans.json'
-    
-    # Load the nnU-Net checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-    
-    # Extract the state_dict from the checkpoint
-    if 'network_weights' in checkpoint:
-        state_dict = checkpoint['network_weights']
-    else:
-        # Fallback if the checkpoint was saved differently
-        state_dict = checkpoint.get('state_dict', checkpoint)
-    
-    # Load the json config file to get the initialization arguments for the nnU-Net model
+def _parse_arch_kwargs(json_config_path):
+    """Parse and resolve architecture kwargs from a nnU-Net plans.json."""
     with open(json_config_path, 'r') as f:
         init_args = json.load(f)
     init_args = init_args['configurations']['3d_fullres']['architecture']['arch_kwargs']
@@ -44,9 +27,32 @@ def load_nnunet_weights(model_folder):
         init_args['norm_op'] = pydoc.locate(init_args['norm_op'])
     if isinstance(init_args.get('nonlin'), str):
         init_args['nonlin'] = pydoc.locate(init_args['nonlin'])
-    
-    # Build a ResidualEncoderUNet to load the weights and then extract the relevant parts for MambaXNet
-    res_enc_unet = ResidualEncoderUNet(input_channels=1, num_classes=2, **init_args)
+    return init_args
+
+
+def build_resenc_unet(json_config_path):
+    """
+    Build a ResidualEncoderUNet from a plans.json config (random weights).
+    """
+    init_args = _parse_arch_kwargs(json_config_path)
+    return ResidualEncoderUNet(input_channels=1, num_classes=2, **init_args)
+
+
+def load_nnunet_weights(model_folder):
+    """
+    Build a ResidualEncoderUNet and load pretrained nnU-Net weights into it.
+    Used at training time to initialise MambaXNet with pretrained encoder/decoder.
+    """
+    checkpoint_path = f'{model_folder}/fold_0/checkpoint_best.pth'
+    json_config_path = f'{model_folder}/plans.json'
+
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+    if 'network_weights' in checkpoint:
+        state_dict = checkpoint['network_weights']
+    else:
+        state_dict = checkpoint.get('state_dict', checkpoint)
+
+    res_enc_unet = build_resenc_unet(json_config_path)
     res_enc_unet.load_state_dict(state_dict)
 
     return res_enc_unet
@@ -82,8 +88,9 @@ class ShapeExtractorModule(nn.Module):
 
 
 class MambaXNet(nn.Module):
-    def __init__(self, n_channels=1, resenc_model=None, n_classes=2):
+    def __init__(self, plans_json: str, n_channels=1, n_classes=2):
         super(MambaXNet, self).__init__()
+        resenc_model = build_resenc_unet(plans_json)
         # Reconstruction of the encoder layers
         enc = resenc_model.encoder
         self.enc_stem = enc.stem
@@ -107,6 +114,21 @@ class MambaXNet(nn.Module):
         self.m_cam1 = MCAM(in_channels=32, embed_dim=128, num_heads=8, sem_channels=32)
         self.m_cam2 = MCAM(in_channels=64, embed_dim=64, num_heads=8, sem_channels=32)
         self.m_cam3 = MCAM(in_channels=128, embed_dim=32, num_heads=8, sem_channels=32)
+
+    def load_pretrained_resenc(self, model_folder: str):
+        """
+        Load pretrained nnU-Net weights into the encoder and decoder.
+        Call this at training time for weight initialisation.
+        """
+        resenc_model = load_nnunet_weights(model_folder)
+        enc = resenc_model.encoder
+        self.enc_stem.load_state_dict(enc.stem.state_dict())
+        for i, stage in enumerate(enc.stages):
+            getattr(self, f'enc_stage{i}').load_state_dict(stage.state_dict())
+        dec = resenc_model.decoder
+        self.transpconvs.load_state_dict(dec.transpconvs.state_dict())
+        self.dec_stages.load_state_dict(dec.stages.state_dict())
+        self.seg_layers.load_state_dict(dec.seg_layers.state_dict())
 
     def forward(self, i_t: torch.Tensor,
                 i_prev: torch.Tensor,
@@ -178,12 +200,13 @@ def main():
 
     # Try loading the nnU-Net weights into MambaXNet
     model_folder = '/home/plbenveniste/net/longitudinal_mamba/trained_resencUnet/nnUNetTrainerDiceCELoss_noSmooth_4000epochs_fromScratch__nnUNetResEncUNetL1x1x1_Model2_Plans__3d_fullres'
-    # Load resenc model with pretrained nnU-Net weights
-    resenc_model = load_nnunet_weights(model_folder)
-    print("Pretrained nnU-Net weights loaded successfully into ResEncoderUNet model.")
+    plans_json = f'{model_folder}/plans.json'
 
-    # initialize MambaXNet with the loaded ResEncoderUNet model
-    model = MambaXNet(n_channels=1, resenc_model=resenc_model, n_classes=2)
+    # Initialize MambaXNet from architecture config
+    model = MambaXNet(plans_json=plans_json, n_channels=1, n_classes=2)
+    # Load pretrained nnU-Net weights into encoder/decoder
+    model.load_pretrained_resenc(model_folder)
+    print("MambaXNet initialised with pretrained nnU-Net weights.")
     model.to(device)
     model.eval()
     print("MambaXNet initialized with pretrained nnU-Net weights.")
