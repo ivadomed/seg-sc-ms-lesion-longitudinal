@@ -23,7 +23,7 @@ from torch.optim.lr_scheduler import LambdaLR
 import numpy as np
 import wandb
 
-from mambaxnet import load_nnunet_weights, MambaXNet
+from mambaxnet import MambaXNet
 from load_dataset import get_dataloaders
 from wandb_logging import log_validation_images
 
@@ -226,8 +226,10 @@ def main():
     logger.info(f"Train batches: {len(train_loader)} | Val batches: {len(val_loader)}")
 
     logger.info("Initialising MambaXNet …")
-    resencUnet = load_nnunet_weights(args.unet)
-    model = MambaXNet(n_channels=1, resenc_model=resencUnet, n_classes=args.n_classes)
+    plans_json = os.path.join(args.unet, "plans.json")
+    model = MambaXNet(plans_json=plans_json, n_channels=1, n_classes=args.n_classes)
+    model.load_pretrained_resenc(args.unet)
+    logger.info("Loaded pretrained nnU-Net weights into encoder/decoder.")
     model.to(device)
 
     if args.freeze_encoder:
@@ -300,7 +302,10 @@ def main():
 
         if val_dice > best_val_dice:
             best_val_dice = val_dice
-            torch.save(model.state_dict(), os.path.join(output_path, "best_model.pth"))
+            torch.save({
+                "state_dict": model.state_dict(),
+                "plans_json": plans_json,
+            }, os.path.join(output_path, "best_model.pth"))
             logger.info(f"  New best val dice: {best_val_dice:.4f}")
             wandb.log({"val/best_dice": best_val_dice}, step=global_step)
 
