@@ -45,15 +45,16 @@ class LongitudinalLesionDataset(Dataset):
         entry = self.samples[idx]
 
         sample = {
-            "image1":   self._load_nifti(entry["image1"]),
-            "label1":   self._load_nifti(entry["label1"]),
-            "image2":   self._load_nifti(entry["image2"]),
-            "label2":   self._load_nifti(entry["label2"]),
+            "image1":       self._load_nifti(entry["image1"]),
+            "label1":       self._load_nifti(entry["label1"]),
+            "image2":       self._load_nifti(entry["image2"]),
+            "label2":       self._load_nifti(entry["label2"]),
             # metadata — not tensors, kept out of the collate stack
-            "subject":  entry["subject"],
-            "contrast": entry["contrast"],
-            "session1": entry["session1"],
-            "session2": entry["session2"],
+            "subject":      entry["subject"],
+            "contrast":     entry["contrast"],
+            "session1":     entry["session1"],
+            "session2":     entry["session2"],
+            "image2_path":  entry["image2"],
         }
 
         if self.transform:
