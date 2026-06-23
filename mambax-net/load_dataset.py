@@ -212,7 +212,7 @@ def longitudinal_collate(batch: list) -> dict:
     This stacks tensors and collects strings into lists.
     """
     tensor_keys = {"image1", "label1", "image2", "label2"}
-    string_keys = {"subject", "contrast", "session1", "session2"}
+    string_keys = {"subject", "contrast", "session1", "session2", "image2_path"}
 
     out = {}
     for key in tensor_keys:
