@@ -21,6 +21,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import LambdaLR
 import numpy as np
+import nibabel as nib
 import wandb
 
 from mambaxnet import MambaXNet
@@ -95,6 +96,43 @@ def forward_pair(model: nn.Module, batch: dict, device: torch.device):
     targets = label2.squeeze(1)            # (B, *spatial)
     preds   = model(image2, image1, label1)
     return preds, targets
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Debug — save the patches seen by the model
+# ──────────────────────────────────────────────────────────────────────────────
+
+def save_batch_patches(batch: dict, out_dir: str):
+    """
+    Dump every volume in a batch (image1/label1/image2/label2) to NIfTI so the
+    exact patches fed to the model can be inspected. Affine is taken from the
+    MetaTensor when available, otherwise identity.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    keys = ["image1", "label1", "image2", "label2"]
+    bsz  = batch["image1"].shape[0]
+
+    for b in range(bsz):
+        subject  = batch.get("subject",  ["unknown"] * bsz)[b]
+        session1 = batch.get("session1", ["s1"] * bsz)[b]
+        session2 = batch.get("session2", ["s2"] * bsz)[b]
+        prefix   = f"b{b}_{subject}_{session1}_{session2}"
+
+        for key in keys:
+            vol = batch[key][b]                       # (1, H, W, D)
+            arr = vol.squeeze(0).detach().cpu().numpy().astype(np.float32)
+
+            # Recover the affine from the MONAI MetaTensor if present
+            affine = getattr(vol, "affine", None)
+            if affine is not None:
+                affine = affine.detach().cpu().numpy()
+            else:
+                affine = np.eye(4)
+
+            path = os.path.join(out_dir, f"{prefix}_{key}.nii.gz")
+            nib.save(nib.Nifti1Image(arr, affine), path)
+
+        logger.info(f"Saved debug patches for sample {b} ({subject}) → {out_dir}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -194,6 +232,8 @@ def parse_args():
     parser.add_argument("--wandb_offline",    action="store_true")
     parser.add_argument("--freeze-encoder",   action="store_true",
                         help="Freeze encoder weights (stem + all stages).")
+    parser.add_argument("--debug-save-patches", action="store_true",
+                        help="Save the first training batch's patches as NIfTI, then stop.")
     return parser.parse_args()
 
 
@@ -222,7 +262,7 @@ def main():
     logger.info(f"Device: {device}")
 
     logger.info("Loading dataset …")
-    train_loader, val_loader, _ = get_dataloaders(json_path=args.data, batch_size=2)
+    train_loader, val_loader, _ = get_dataloaders(json_path=args.data, batch_size=2, target_shape=(64, 64, 160))
     logger.info(f"Train batches: {len(train_loader)} | Val batches: {len(val_loader)}")
 
     logger.info("Initialising MambaXNet …")
@@ -258,6 +298,15 @@ def main():
     scaler    = torch.cuda.amp.GradScaler()
     logger.info(f"SGD | lr={args.lr} | momentum=0.99 | weight_decay=3e-5 | nesterov=True")
     logger.info(f"PolyLR | exponent=0.9 | max_epochs={args.epochs}")
+
+    if args.debug_save_patches:
+        debug_dir = os.path.join(output_path, "debug_patches")
+        logger.info(f"Debug mode: saving first training batch patches → {debug_dir}")
+        first_batch = next(iter(train_loader))
+        save_batch_patches(first_batch, debug_dir)
+        logger.info("Debug patches saved. Stopping.")
+        wandb.finish()
+        return
 
     best_val_dice = 0.0
     global_step   = 0
