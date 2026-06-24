@@ -87,9 +87,10 @@ def log_validation_images(model: torch.nn.Module,
                            val_loader,
                            device: torch.device,
                            global_step: int,
-                           n_images: int = 3) -> None:
+                           n_images: int = 3,
+                           predict_fn=None) -> None:
     """
-    Sample up to `n_images` validation patches that contain foreground in
+    Sample up to `n_images` validation volumes that contain foreground in
     label2, run inference, and log image2/GT/pred panels to W&B.
 
     Args:
@@ -98,6 +99,9 @@ def log_validation_images(model: torch.nn.Module,
         device      : torch device
         global_step : current training step (for W&B x-axis)
         n_images    : how many panels to log (default 3)
+        predict_fn  : optional full-volume predictor (i_t, i_prev, m_prev) ->
+                      logits. Required when the loader returns whole volumes —
+                      a direct model() call would OOM. Falls back to model().
     """
     model.eval()
     collected     = []   # list of wandb.Image
@@ -112,7 +116,10 @@ def log_validation_images(model: torch.nn.Module,
         image2 = batch["image2"].to(device)
         label2 = batch["label2"].to(device)
 
-        preds = model(image2, image1, label1)          # (B, n_classes, H, W, D)
+        if predict_fn is not None:
+            preds = predict_fn(image2, image1, label1)  # (B, n_classes, H, W, D)
+        else:
+            preds = model(image2, image1, label1)
         pred_labels = preds.argmax(dim=1)              # (B, H, W, D)
 
         B = image2.shape[0]
