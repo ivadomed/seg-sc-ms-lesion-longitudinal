@@ -76,7 +76,7 @@ class LongitudinalLesionDataset(Dataset):
 # 2. MONAI transforms
 # ------------------------------------------------------------------ #
 
-def get_transforms(split: str, target_shape=(64, 64, 160)):
+def get_transforms(split: str, target_shape=(64, 64, 160), crop: bool = True):
     """
     Returns a MONAI Compose for training or inference.
     All keys operate on image1/label1 and image2/label2 in parallel
@@ -85,6 +85,11 @@ def get_transforms(split: str, target_shape=(64, 64, 160)):
     `target_shape` is given in RPI axis order (R-L, P-A, I-S). The default
     (64, 64, 160) is long along I-S (dim 2) so every patch contains a large
     extent of the spinal cord.
+
+    `crop`: when True (training), pad/crop every volume to `target_shape`.
+    When False (full-volume evaluation), keep the native size so sliding-window
+    inference can tile the whole image — set the DataLoader batch_size to 1
+    because volumes then have different shapes and cannot be stacked.
     """
     image_keys = ["image1", "image2"]
     label_keys = ["label1", "label2"]
@@ -97,8 +102,11 @@ def get_transforms(split: str, target_shape=(64, 64, 160)):
         # Resample to 1mm iso
         T.Spacingd(keys=image_keys + label_keys, pixdim=(1.0, 1.0, 1.0),
                    mode=["bilinear"] * len(image_keys) + ["nearest"] * len(label_keys)),
+    ]
+    if crop:
         # Ensure uniform spatial size — adjust to your data
-        T.ResizeWithPadOrCropd(keys=all_keys, spatial_size=target_shape),
+        base.append(T.ResizeWithPadOrCropd(keys=all_keys, spatial_size=target_shape))
+    base += [
         # Intensity normalise images only
         T.NormalizeIntensityd(keys=image_keys, nonzero=True, channel_wise=True),
         T.ToTensord(keys=all_keys),
@@ -243,23 +251,31 @@ def get_dataloaders(json_path: str,
                     target_shape=(64, 64, 160),
                     batch_size: int = 2,
                     num_workers: int = 4,
-                    oversample_rate: float = 0.33):
+                    oversample_rate: float = 0.33,
+                    eval_full_volume: bool = True):
     """
     Returns (train, val, test) DataLoaders.
 
     The training loader uses ForegroundOversampledSampler so that
     `oversample_rate` fraction of each epoch's samples are guaranteed to
-    contain at least one foreground lesion voxel (label2 > 0).
-    Val and test loaders iterate sequentially without oversampling.
+    contain at least one foreground lesion voxel (label2 > 0). Training always
+    operates on `target_shape` patches.
+
+    `eval_full_volume`: when True (default), the val/test loaders return whole
+    volumes (no crop) at batch_size 1, so evaluation can use sliding-window
+    inference over the full image rather than scoring arbitrary crops. When
+    False, val/test also crop to `target_shape` (the old patch-level behaviour).
     """
     loaders = {}
     for split in ("train", "validation", "test"):
+        is_train = split == "train"
+        crop = True if is_train else (not eval_full_volume)
         ds = LongitudinalLesionDataset(
             json_path  = json_path,
             split      = split,
-            transform  = get_transforms(split, target_shape),
+            transform  = get_transforms(split, target_shape, crop=crop),
         )
-        if split == "train":
+        if is_train:
             sampler = ForegroundOversampledSampler(
                 ds, label_key="label2", oversample_rate=oversample_rate
             )
@@ -272,9 +288,11 @@ def get_dataloaders(json_path: str,
                 collate_fn  = longitudinal_collate,
             )
         else:
+            # Full-volume eval cannot stack variable-sized volumes → batch_size 1.
+            eval_bs = 1 if eval_full_volume else batch_size
             loaders[split] = DataLoader(
                 ds,
-                batch_size  = batch_size,
+                batch_size  = eval_bs,
                 shuffle     = False,
                 num_workers = num_workers,
                 pin_memory  = True,
