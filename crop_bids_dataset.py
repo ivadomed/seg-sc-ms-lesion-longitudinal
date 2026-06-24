@@ -4,6 +4,10 @@ Takes a BIDS dataset and produces a duplicate with SC-cropped images and lesion 
 Arguments:
     -i: Path to the source BIDS dataset
     -o: Path for the cropped output dataset (created if absent)
+    -pad-sup: Superior padding in mm (default: 40)
+    -pad-inf: Inferior padding in mm (default: 100)
+    -pad-rl: Right-Left padding in mm (default: 20)
+    -canproco: If we crop the canproco dataset, then we only deal with PSIR and STIR data.
     
 Author: Pierre-Louis Benveniste
 """
@@ -15,20 +19,40 @@ import nibabel as nib
 import numpy as np
 import tqdm
 from sc_crop import crop, detect
+import os
 
 
 # ---------------------------------------------------------------------------
 # BIDS helpers
 # ---------------------------------------------------------------------------
 
-def find_cases(bids_root: Path) -> dict:
+def find_cases(bids_root: Path, canproco: bool) -> dict:
     """Return {image_path: label_path | None} for every image under sub-*/ses-*/anat/."""
     cases = {}
-    for img in sorted(bids_root.glob("sub-*/ses-*/anat/*.nii.gz")):
+    list_images = sorted(bids_root.glob("sub-*/ses-*/anat/*.nii.gz"))
+    if canproco:
+        list_images = [img for img in list_images if "PSIR" in img.name or "STIR" in img.name]
+        subjecsts_to_remove = ["sub-cal123"]
+        list_images = [img for img in list_images if img.parts[-4] not in subjecsts_to_remove]
+
+
+    for img in list_images:
         stem  = img.name.replace(".nii.gz", "")
         lbl   = (bids_root / "derivatives" / "labels"
                  / img.relative_to(bids_root).parent
                  / f"{stem}_label-lesion_seg.nii.gz")
+        if canproco:
+            lbl = (bids_root / "derivatives" / "labels"
+                   / img.relative_to(bids_root).parent
+                   / f"{stem}_lesion-manual.nii.gz")
+        if canproco and not lbl.exists():
+            # Then in this case, we segment the lesions on the original image
+            pred_lesion_seg = (bids_root / "derivatives" / "labels-pred"
+                               / img.relative_to(bids_root).parent
+                               / f"{stem}_lesion-manual.nii.gz")
+            lbl = pred_lesion_seg
+            if not lbl.exists():
+                assert os.system(f"SCT_USE_GPU=1 sct_deepseg lesion_ms -i {img} -o {pred_lesion_seg} -v 0") == 0
         cases[img] = lbl if lbl.exists() else None
     return cases
 
@@ -66,6 +90,7 @@ def parse_args():
     p.add_argument("--pad-inf",  type=float, default=100, help="Inferior padding mm  (default: 100)")
     p.add_argument("--pad-rl",   type=float, default=20,  help="Right-Left padding mm (default: 20)")
     p.add_argument("--pad-ap",   type=float, default=20,  help="A-P padding mm        (default: 20)")
+    p.add_argument("--canproco", action="store_true", help="If we crop the canproco dataset, then we only deal with PSIR and STIR data.")
     return p.parse_args()
 
 
@@ -81,7 +106,7 @@ def main():
         pad_ap=args.pad_ap,
     )
 
-    cases = find_cases(src)
+    cases = find_cases(src, args.canproco)
     print(f"Found {len(cases)} images")
 
     with tempfile.TemporaryDirectory(prefix="sc_crop_") as tmp:
