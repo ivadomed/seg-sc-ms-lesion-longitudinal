@@ -4,6 +4,7 @@ import numpy as np
 import nibabel as nib
 from torch.utils.data import Dataset, DataLoader, Sampler
 from monai import transforms as T
+from monai.data import MetaTensor
 
 
 # ------------------------------------------------------------------ #
@@ -36,10 +37,18 @@ class LongitudinalLesionDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
-    def _load_nifti(self, path: str) -> torch.Tensor:
-        """Load a NIfTI file and return a (1, H, W, D) float32 tensor."""
-        vol = nib.load(path).get_fdata(dtype=np.float32)
-        return torch.from_numpy(vol).unsqueeze(0)   # add channel dim
+    def _load_nifti(self, path: str) -> MetaTensor:
+        """Load a NIfTI file and return a (1, H, W, D) float32 MetaTensor.
+
+        The affine is preserved so that downstream MONAI transforms
+        (Orientationd, Spacingd, …) operate in real anatomical space.
+        Without it, reorientation and resampling silently become no-ops.
+        """
+        nii = nib.load(path)
+        vol = nii.get_fdata(dtype=np.float32)
+        tensor = torch.from_numpy(vol).unsqueeze(0)             # add channel dim
+        affine = torch.as_tensor(nii.affine, dtype=torch.float32)
+        return MetaTensor(tensor, affine=affine)
 
     def __getitem__(self, idx: int) -> dict:
         entry = self.samples[idx]
@@ -67,11 +76,15 @@ class LongitudinalLesionDataset(Dataset):
 # 2. MONAI transforms
 # ------------------------------------------------------------------ #
 
-def get_transforms(split: str, target_shape=(192, 192, 192)):
+def get_transforms(split: str, target_shape=(64, 64, 160)):
     """
     Returns a MONAI Compose for training or inference.
     All keys operate on image1/label1 and image2/label2 in parallel
     so spatial augmentations are applied IDENTICALLY to both timepoints.
+
+    `target_shape` is given in RPI axis order (R-L, P-A, I-S). The default
+    (64, 64, 160) is long along I-S (dim 2) so every patch contains a large
+    extent of the spinal cord.
     """
     image_keys = ["image1", "image2"]
     label_keys = ["label1", "label2"]
@@ -227,7 +240,7 @@ def longitudinal_collate(batch: list) -> dict:
 # ------------------------------------------------------------------ #
 
 def get_dataloaders(json_path: str,
-                    target_shape=(160, 64, 64),
+                    target_shape=(64, 64, 160),
                     batch_size: int = 2,
                     num_workers: int = 4,
                     oversample_rate: float = 0.33):
