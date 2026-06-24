@@ -51,7 +51,16 @@ def _make_panel(image2: np.ndarray, gt2: np.ndarray, pred: np.ndarray,
     gt_sl   = _get_slice(gt2,    axis, slice_idx)
     pred_sl = _get_slice(pred,   axis, slice_idx)
 
-    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+    # Size each panel to the true slice aspect ratio so the spinal cord is not
+    # squished into a fixed-size box. Arrays are shown transposed (arr.T), so
+    # the displayed image has shape (cols, rows) = arr.shape; rows along the
+    # vertical axis. With a 64x64x160 RPI patch the sagittal plane is 64 x 160,
+    # i.e. a tall panel that must keep its 1:3 ratio.
+    disp_rows, disp_cols = img_sl.shape[1], img_sl.shape[0]
+    panel_h = 5.0
+    panel_w = max(1.5, panel_h * (disp_cols / disp_rows))
+
+    fig, axes = plt.subplots(1, 3, figsize=(3 * panel_w, panel_h))
     titles = [f"image2 ({plane_name} #{slice_idx})",
               "GT label2",
               "Prediction"]
@@ -59,7 +68,9 @@ def _make_panel(image2: np.ndarray, gt2: np.ndarray, pred: np.ndarray,
     cmaps = ["gray", "hot", "hot"]
 
     for ax, title, arr, cmap in zip(axes, titles, data, cmaps):
-        ax.imshow(arr.T, origin="lower", cmap=cmap,
+        # aspect="equal" guarantees square voxels (no compression) regardless
+        # of the figure/axes box; the figsize above keeps whitespace minimal.
+        ax.imshow(arr.T, origin="lower", cmap=cmap, aspect="equal",
                   vmin=0, vmax=1 if cmap == "gray" else arr.max() or 1)
         ax.set_title(title, fontsize=9)
         ax.axis("off")
