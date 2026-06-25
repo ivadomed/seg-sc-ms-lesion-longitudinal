@@ -84,6 +84,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device, n_classes, epoc
         with torch.no_grad():
             # Deep supervision returns a list (highest-res first); score the finest.
             finest = preds[0] if isinstance(preds, (list, tuple)) else preds
+            # TODO: change next function to function on binary not logits (similar as in val)
             dice = compute_dice(finest.detach(), targets, n_classes)
 
         total_loss += loss.item()
@@ -148,9 +149,6 @@ def parse_args():
     parser.add_argument("--output",         type=str, required=True)
     parser.add_argument("--epochs",         type=int,   default=1000,
                         help="Number of epochs (nnU-Net default: 1000).")
-    parser.add_argument("--iters-per-epoch", type=int,  default=250,
-                        help="Training minibatches per epoch (nnU-Net default: "
-                             "250). An epoch is decoupled from the dataset size.")
     parser.add_argument("--lr",             type=float, default=1e-2)
     parser.add_argument("--n_classes",      type=int,   default=2)
     parser.add_argument("--wandb_project",  type=str,   default="mambaxnet-longitudinal")
@@ -222,17 +220,16 @@ def main():
     roi_size = tuple(args.roi_size)
     logger.info("Loading dataset …")
     # Train and validate on patches (validation = centre crop to roi_size).
+    # One shuffled pass over the full dataset per epoch.
     train_loader, val_loader, _ = get_dataloaders(
-        json_path=args.data, batch_size=2, target_shape=roi_size, eval_full_volume=False,
-        num_iterations_per_epoch=args.iters_per_epoch)
+        json_path=args.data, batch_size=2, target_shape=roi_size, eval_full_volume=False)
     logger.info(f"Train batches: {len(train_loader)} | Val batches: {len(val_loader)}")
     if args.zero_prev_mask:
         logger.info("ABLATION: previous-timepoint mask zeroed (train + eval).")
 
     logger.info(f"Initialising MambaXNet ({args.model_version}) …")
     plans_json = os.path.join(args.unet, "plans.json")
-    ModelClass = MambaXNetV2 if args.model_version == "v2" else MambaXNet
-    model = ModelClass(plans_json=plans_json, n_channels=1, n_classes=args.n_classes)
+    model = MambaXNet(plans_json=plans_json, n_channels=1, n_classes=args.n_classes)
     model.load_pretrained_resenc(args.unet)
     logger.info("Loaded pretrained nnU-Net weights into encoder/decoder.")
     model.to(device)
@@ -251,12 +248,7 @@ def main():
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"Trainable parameters: {n_params:,}")
 
-    # nnU-Net loss: Dice (batch_dice from plans.json) + CE, optionally applied
-    # with deep supervision across decoder resolutions.
-    with open(plans_json) as f:
-        _plans = json.load(f)
-    batch_dice = bool(_plans["configurations"]["3d_fullres"].get("batch_dice", True))
-    base_criterion = CombinedLoss(n_classes=args.n_classes, batch_dice=batch_dice)
+    base_criterion = CombinedLoss(n_classes=args.n_classes, batch_dice=False)
 
     if args.deep_supervision:
         # Deep-supervision weights: 1, 1/2, 1/4, … one per decoder output, with
@@ -266,11 +258,11 @@ def main():
         ds_weights[-1] = 0.0
         ds_weights = ds_weights / ds_weights.sum()
         criterion = DeepSupervisionLoss(base_criterion, ds_weights)
-        logger.info(f"Loss: Dice(batch_dice={batch_dice})+CE | deep-supervision "
+        logger.info(f"Loss: Dice(batch_dice={False})+CE | deep-supervision "
                     f"weights {np.round(ds_weights, 3).tolist()}")
     else:
         criterion = base_criterion
-        logger.info(f"Loss: Dice(batch_dice={batch_dice})+CE | deep supervision OFF")
+        logger.info(f"Loss: Dice(batch_dice={False})+CE | deep supervision OFF")
 
     optimizer = optim.SGD(
         filter(lambda p: p.requires_grad, model.parameters()),

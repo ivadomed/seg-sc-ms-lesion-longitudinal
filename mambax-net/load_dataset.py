@@ -2,7 +2,7 @@ import json
 import torch
 import numpy as np
 import nibabel as nib
-from torch.utils.data import Dataset, DataLoader, Sampler
+from torch.utils.data import Dataset, DataLoader
 from monai import transforms as T
 from monai.data import MetaTensor
 
@@ -228,35 +228,7 @@ def get_transforms(split: str, target_shape=(64, 64, 160), crop: bool = True,
 
 
 # ------------------------------------------------------------------ #
-# 3. Fixed-length sampler (nnU-Net-style epoch)
-# ------------------------------------------------------------------ #
-
-class FixedLengthRandomSampler(Sampler):
-    """
-    Yields a fixed number of random indices (with replacement) per epoch, so an
-    "epoch" is a fixed number of iterations decoupled from the dataset size —
-    matching nnU-Net (num_iterations_per_epoch × batch_size samples per epoch,
-    1000 epochs).
-
-    Foreground oversampling is no longer the sampler's job: it is handled at the
-    patch level by RandCropByPosNegLabeld in get_transforms, which centres a
-    fraction of crops on a lesion voxel (closer to nnU-Net than picking whole
-    foreground-containing volumes, and it removes the startup label scan).
-    """
-
-    def __init__(self, dataset_len: int, num_samples: int):
-        self.dataset_len = dataset_len
-        self.num_samples = num_samples
-
-    def __iter__(self):
-        return iter(np.random.randint(0, self.dataset_len, size=self.num_samples).tolist())
-
-    def __len__(self) -> int:
-        return self.num_samples
-
-
-# ------------------------------------------------------------------ #
-# 4. Custom collate — handles the string metadata fields
+# 3. Custom collate — handles the string metadata fields
 # ------------------------------------------------------------------ #
 
 def longitudinal_collate(batch: list) -> dict:
@@ -276,7 +248,7 @@ def longitudinal_collate(batch: list) -> dict:
 
 
 # ------------------------------------------------------------------ #
-# 5. DataLoader factory
+# 4. DataLoader factory
 # ------------------------------------------------------------------ #
 
 def get_dataloaders(json_path: str,
@@ -284,20 +256,19 @@ def get_dataloaders(json_path: str,
                     batch_size: int = 2,
                     num_workers: int = 4,
                     oversample_rate: float = 0.33,
-                    eval_full_volume: bool = True,
-                    num_iterations_per_epoch: int = 250):
+                    eval_full_volume: bool = False):
     """
     Returns (train, val, test) DataLoaders.
 
-    Training mirrors nnU-Net: each epoch is a fixed `num_iterations_per_epoch`
-    batches (FixedLengthRandomSampler), and `oversample_rate` of the patches are
-    centred on a lesion voxel via RandCropByPosNegLabeld in get_transforms.
+    Training shuffles the full dataset once per epoch; foreground oversampling is
+    done at the patch level by RandCropByPosNegLabeld in get_transforms
+    (`oversample_rate` of patches are centred on a lesion voxel).
     Training always operates on `target_shape` patches.
 
-    `eval_full_volume`: when True (default), the val/test loaders return whole
-    volumes (no crop) at batch_size 1, so evaluation can use sliding-window
-    inference over the full image rather than scoring arbitrary crops. When
-    False, val/test also crop to `target_shape` (the old patch-level behaviour).
+    `eval_full_volume`: when False (default), the val/test loaders crop to
+    `target_shape` so validation scores patches directly — matching the
+    patch-level `validate()` in training.py. When True, they instead return whole
+    volumes at batch_size 1 for full-image (sliding-window) evaluation.
     """
     loaders = {}
     for split in ("train", "validation", "test"):
@@ -310,15 +281,12 @@ def get_dataloaders(json_path: str,
                                         oversample_rate=oversample_rate),
         )
         if is_train:
-            # Fixed-length epoch (decoupled from dataset size); foreground
-            # oversampling is done at the patch level in get_transforms.
-            sampler = FixedLengthRandomSampler(
-                len(ds), num_samples=num_iterations_per_epoch * batch_size
-            )
+            # One shuffled pass over the dataset per epoch; foreground
+            # oversampling is handled at the patch level in get_transforms.
             loaders[split] = DataLoader(
                 ds,
                 batch_size  = batch_size,
-                sampler     = sampler,        # replaces shuffle=True
+                shuffle     = True,
                 num_workers = num_workers,
                 pin_memory  = True,
                 collate_fn  = longitudinal_collate,

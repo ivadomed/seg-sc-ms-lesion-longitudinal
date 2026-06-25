@@ -23,7 +23,7 @@ import torch
 # Voxel-wise
 # ──────────────────────────────────────────────────────────────────────────────
 
-def dice_score(prediction, groundtruth, smooth: float = 1.0) -> float:
+def dice_score(prediction, groundtruth, smooth: float = 1e-5) -> float:
     """Soft/hard Dice with additive smoothing.
 
     With `smooth=1`, two empty masks score 1.0 (model correctly predicts
