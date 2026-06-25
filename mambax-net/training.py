@@ -61,9 +61,11 @@ def forward_pair(model: nn.Module, batch: dict, device: torch.device,
 # ──────────────────────────────────────────────────────────────────────────────
 
 def train_one_epoch(model, loader, optimizer, criterion, device, n_classes, epoch, global_step, scaler,
-                    zero_prev_mask=False):
+                    zero_prev_mask=False, deep_supervision=True):
     model.train()
-    model.deep_supervision = True   # multi-scale outputs for the deep-supervised loss
+    # Multi-scale outputs when deep supervision is enabled; otherwise the model
+    # returns only the full-resolution output. (validate() always sets False.)
+    model.deep_supervision = deep_supervision
     total_loss = 0.0
     total_dice = 0.0
 
@@ -160,6 +162,11 @@ def parse_args():
                         help="Save the first training batch's patches as NIfTI, then stop.")
     parser.add_argument("--model-version", choices=["v1", "v2"], default="v1",
                         help="v1: M-CAM at 3 finest levels. v2: + bottleneck fusion.")
+    parser.add_argument("--deep-supervision", default=True,
+                        action=argparse.BooleanOptionalAction,
+                        help="Apply the loss at every decoder resolution (nnU-Net "
+                             "deep supervision). Use --no-deep-supervision to train "
+                             "on the full-resolution output only.")
     parser.add_argument("--zero-prev-mask", action="store_true",
                         help="Ablation: zero the previous-timepoint mask everywhere "
                              "(train + eval) to measure reliance on the prior.")
@@ -244,22 +251,26 @@ def main():
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"Trainable parameters: {n_params:,}")
 
-    # nnU-Net loss: Dice (batch_dice from plans.json) + CE, applied with deep
-    # supervision across decoder resolutions.
+    # nnU-Net loss: Dice (batch_dice from plans.json) + CE, optionally applied
+    # with deep supervision across decoder resolutions.
     with open(plans_json) as f:
         _plans = json.load(f)
     batch_dice = bool(_plans["configurations"]["3d_fullres"].get("batch_dice", True))
     base_criterion = CombinedLoss(n_classes=args.n_classes, batch_dice=batch_dice)
 
-    # Deep-supervision weights: 1, 1/2, 1/4, … one per decoder output, with the
-    # coarsest level dropped (weight 0) then normalised — identical to nnU-Net.
-    n_ds = len(model.seg_layers)
-    ds_weights = np.array([1 / (2 ** i) for i in range(n_ds)], dtype=float)
-    ds_weights[-1] = 0.0
-    ds_weights = ds_weights / ds_weights.sum()
-    criterion = DeepSupervisionLoss(base_criterion, ds_weights)
-    logger.info(f"Loss: Dice(batch_dice={batch_dice})+CE | deep-supervision "
-                f"weights {np.round(ds_weights, 3).tolist()}")
+    if args.deep_supervision:
+        # Deep-supervision weights: 1, 1/2, 1/4, … one per decoder output, with
+        # the coarsest level dropped (weight 0) then normalised — like nnU-Net.
+        n_ds = len(model.seg_layers)
+        ds_weights = np.array([1 / (2 ** i) for i in range(n_ds)], dtype=float)
+        ds_weights[-1] = 0.0
+        ds_weights = ds_weights / ds_weights.sum()
+        criterion = DeepSupervisionLoss(base_criterion, ds_weights)
+        logger.info(f"Loss: Dice(batch_dice={batch_dice})+CE | deep-supervision "
+                    f"weights {np.round(ds_weights, 3).tolist()}")
+    else:
+        criterion = base_criterion
+        logger.info(f"Loss: Dice(batch_dice={batch_dice})+CE | deep supervision OFF")
 
     optimizer = optim.SGD(
         filter(lambda p: p.requires_grad, model.parameters()),
@@ -292,7 +303,8 @@ def main():
 
         train_loss, train_dice, global_step = train_one_epoch(
             model, train_loader, optimizer, criterion, device, args.n_classes,
-            epoch, global_step, scaler, zero_prev_mask=args.zero_prev_mask
+            epoch, global_step, scaler, zero_prev_mask=args.zero_prev_mask,
+            deep_supervision=args.deep_supervision
         )
 
         scheduler.step()
