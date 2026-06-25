@@ -79,7 +79,11 @@ def process_case(image_path, label_path, src_root, dst_root, pad,tmp_dir):
 
     # Same for the label
     label_nii = nib.load(label_path)
-    dst_label = dst_root / label_path.relative_to(src_root)
+    # Predicted segmentations live under derivatives/labels-pred in the source;
+    # store their cropped version under derivatives/labels in the output dataset.
+    rel_parts = tuple("labels" if part == "labels-pred" else part
+                      for part in label_path.relative_to(src_root).parts)
+    dst_label = dst_root.joinpath(*rel_parts)
     dst_label.parent.mkdir(parents=True, exist_ok=True)
     nib.save(crop(label_nii, bbox), dst_label)
 
@@ -122,7 +126,6 @@ def main():
         tmp_dir = Path(tmp)
         for image_path, label_path in tqdm.tqdm(cases.items()):
             process_case(image_path, label_path, src, dst, pad, tmp_dir)
-
 
 if __name__ == "__main__":
     main()
