@@ -16,6 +16,7 @@ Author: Pierre-Louis Benveniste
 
 from scipy import ndimage
 import numpy as np
+import torch
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -33,6 +34,24 @@ def dice_score(prediction, groundtruth, smooth: float = 1.0) -> float:
     numer = (prediction * groundtruth).sum()
     denom = (prediction + groundtruth).sum()
     return float((2 * numer + smooth) / (denom + smooth))
+
+
+# Compute dice score for the entire batch
+def compute_dice(preds: torch.Tensor, targets: torch.Tensor,
+                 n_classes: int, smooth: float = 1e-5) -> float:
+    pred_labels = preds.argmax(dim=1)
+    dice_scores = []
+    for cls in range(1, n_classes):
+        pred_c = (pred_labels == cls).float().view(-1)
+        tgt_c  = (targets == cls).float().view(-1)
+        inter  = (pred_c * tgt_c).sum()
+        denom  = pred_c.sum() + tgt_c.sum()
+        if denom == 0:
+            # empty GT and empty prediction for this class → perfect
+            dice_scores.append(1.0)
+            continue
+        dice_scores.append(((2.0 * inter + smooth) / (denom + smooth)).item())
+    return float(np.mean(dice_scores)) if dice_scores else 0.0
 
 
 # ──────────────────────────────────────────────────────────────────────────────

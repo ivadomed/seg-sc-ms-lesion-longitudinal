@@ -109,11 +109,17 @@ class MambaXNet(nn.Module):
 
         # Build the SEM module to extract shape features from the previous time point
         self.sem = ShapeExtractorModule(in_channels=1, out_channels=32)
-        
+
         # M-CAM blocks integrated at the last three upsampling levels
         self.m_cam1 = MCAM(in_channels=32, embed_dim=128, num_heads=8, sem_channels=32)
         self.m_cam2 = MCAM(in_channels=64, embed_dim=64, num_heads=8, sem_channels=32)
         self.m_cam3 = MCAM(in_channels=128, embed_dim=32, num_heads=8, sem_channels=32)
+
+        # Deep supervision (nnU-Net style): when True, forward returns the seg
+        # outputs of every decoder resolution (highest-res first) so the loss can
+        # be applied at each scale. Default False so inference/GradCAM get a
+        # single logits tensor; the trainer flips it on during training.
+        self.deep_supervision = False
 
     def load_pretrained_resenc(self, model_folder: str):
         """
@@ -140,7 +146,10 @@ class MambaXNet(nn.Module):
             m_prev : (B, 1, *spatial)  segmentation mask at the previous time-point
 
         Returns:
-            out    : (B, n_classes, *spatial)  logits for the current time-point
+            If self.deep_supervision is False (default): a single logits tensor
+            (B, n_classes, *spatial) at full resolution.
+            If True: a list of logits tensors, one per decoder resolution,
+            ordered highest-res first (nnU-Net convention) for deep-supervised loss.
         """
         # Encoder features for current time-point
         e1 = self.enc_stage0(self.enc_stem(i_t))
@@ -164,27 +173,33 @@ class MambaXNet(nn.Module):
         e2_mcam = self.m_cam2(e2, e2_prev, m_prev_shape)
         e3_mcam = self.m_cam3(e3, e3_prev, m_prev_shape)
 
-        # Decoder (transpconv → cat with skip → stage)
+        # Decoder (transpconv → cat with skip → stage). A seg head is applied at
+        # every resolution so deep supervision can use them.
+        seg_outputs = []
         # stage 0: bottleneck e6 → upsample → cat(e5) → 640→320
         d = self.transpconvs[0](e6)
         d = self.dec_stages[0](torch.cat([d, e5], dim=1))
+        seg_outputs.append(self.seg_layers[0](d))
         # stage 1: → cat(e4) → 512→256
         d = self.transpconvs[1](d)
         d = self.dec_stages[1](torch.cat([d, e4], dim=1))
+        seg_outputs.append(self.seg_layers[1](d))
         # stage 2: → cat(e3_mcam) → 256→128
         d = self.transpconvs[2](d)
         d = self.dec_stages[2](torch.cat([d, e3_mcam], dim=1))
+        seg_outputs.append(self.seg_layers[2](d))
         # stage 3: → cat(e2_mcam) → 128→64
         d = self.transpconvs[3](d)
         d = self.dec_stages[3](torch.cat([d, e2_mcam], dim=1))
-        # stage 4: → cat(e1_mcam) → 64→32
+        seg_outputs.append(self.seg_layers[3](d))
+        # stage 4: → cat(e1_mcam) → 64→32 (full resolution)
         d = self.transpconvs[4](d)
         d = self.dec_stages[4](torch.cat([d, e1_mcam], dim=1))
+        seg_outputs.append(self.seg_layers[4](d))
 
-        # Final segmentation head
-        out = self.seg_layers[4](d)   # (B, n_classes, *spatial)
-
-        return out
+        # Highest-resolution output first (nnU-Net convention).
+        seg_outputs = seg_outputs[::-1]
+        return seg_outputs if self.deep_supervision else seg_outputs[0]
 
 
 def main():

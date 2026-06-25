@@ -81,17 +81,25 @@ class MambaXNetV2(MambaXNet):
         e3_mcam = self.m_cam3(e3, e3_prev, m_prev_shape)
         e6_mcam = self.m_cam_bottleneck(e6, e6_prev, m_prev_shape)
 
-        # Decoder — bottleneck now carries temporal context (e6_mcam)
+        # Decoder — bottleneck now carries temporal context (e6_mcam). A seg head
+        # is applied at every resolution so deep supervision can use them.
+        seg_outputs = []
         d = self.transpconvs[0](e6_mcam)
         d = self.dec_stages[0](torch.cat([d, e5], dim=1))
+        seg_outputs.append(self.seg_layers[0](d))
         d = self.transpconvs[1](d)
         d = self.dec_stages[1](torch.cat([d, e4], dim=1))
+        seg_outputs.append(self.seg_layers[1](d))
         d = self.transpconvs[2](d)
         d = self.dec_stages[2](torch.cat([d, e3_mcam], dim=1))
+        seg_outputs.append(self.seg_layers[2](d))
         d = self.transpconvs[3](d)
         d = self.dec_stages[3](torch.cat([d, e2_mcam], dim=1))
+        seg_outputs.append(self.seg_layers[3](d))
         d = self.transpconvs[4](d)
         d = self.dec_stages[4](torch.cat([d, e1_mcam], dim=1))
+        seg_outputs.append(self.seg_layers[4](d))
 
-        out = self.seg_layers[4](d)
-        return out
+        # Highest-resolution output first (nnU-Net convention).
+        seg_outputs = seg_outputs[::-1]
+        return seg_outputs if self.deep_supervision else seg_outputs[0]

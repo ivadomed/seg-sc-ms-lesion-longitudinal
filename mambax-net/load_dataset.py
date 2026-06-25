@@ -68,6 +68,10 @@ class LongitudinalLesionDataset(Dataset):
 
         if self.transform:
             sample = self.transform(sample)
+            # RandCropByPosNegLabeld (training) returns a list of `num_samples`
+            # crops; we use num_samples=1, so unwrap back to a single dict.
+            if isinstance(sample, list):
+                sample = sample[0]
 
         return sample
 
@@ -76,43 +80,88 @@ class LongitudinalLesionDataset(Dataset):
 # 2. MONAI transforms
 # ------------------------------------------------------------------ #
 
-def get_transforms(split: str, target_shape=(64, 64, 160), crop: bool = True):
+def get_initial_patch_size(patch_size, rotation: float = 0.52, scale_min: float = 0.7):
+    """Enlarged patch to crop BEFORE spatial augmentation (nnU-Net's
+    "no black borders" trick).
+
+    Rotation/zoom are applied to a patch larger than the final one, which is then
+    centre-cropped to `patch_size` — so the augmentations never pull zero-padding
+    into the final patch. The enlarged size is the bounding box of `patch_size`
+    under the max single-axis rotation, divided by the minimum zoom factor (this
+    mirrors nnU-Net's `get_patch_size`).
+    """
+    p = np.asarray(patch_size, dtype=float)
+
+    def bbox(a: int, b: int, ang: float):
+        out = p.copy()
+        ca, sa = abs(np.cos(ang)), abs(np.sin(ang))
+        out[a] = p[a] * ca + p[b] * sa
+        out[b] = p[a] * sa + p[b] * ca
+        return out
+
+    candidates = np.vstack([p, bbox(1, 2, rotation), bbox(0, 2, rotation), bbox(0, 1, rotation)])
+    initial = candidates.max(axis=0) / scale_min
+    return tuple(int(np.ceil(s)) for s in initial)
+
+
+def get_transforms(split: str, target_shape=(64, 64, 160), crop: bool = True,
+                   oversample_rate: float = 0.33):
     """
     Returns a MONAI Compose for training or inference.
-    All keys operate on image1/label1 and image2/label2 in parallel
-    so spatial augmentations are applied IDENTICALLY to both timepoints.
+    Spatial augmentations are applied IDENTICALLY to both timepoints and labels.
 
     `target_shape` is given in RPI axis order (R-L, P-A, I-S). The default
     (64, 64, 160) is long along I-S (dim 2) so every patch contains a large
     extent of the spinal cord.
 
-    `crop`: when True (training), pad/crop every volume to `target_shape`.
-    When False (full-volume evaluation), keep the native size so sliding-window
-    inference can tile the whole image — set the DataLoader batch_size to 1
-    because volumes then have different shapes and cannot be stacked.
+    Training (split="train") uses nnU-Net-style patch sampling:
+      * current timepoint (image2/label2): a foreground-oversampled RANDOM crop
+        — `oversample_rate` of patches are centred on a lesion voxel, the rest on
+        background (nnU-Net's oversample_foreground_percent).
+      * previous timepoint (image1/label1): a centre pad/crop, fed as fixed
+        global context (matches the sliding-window validation predictor).
+      * both are cropped to an ENLARGED patch first; spatial augmentation runs on
+        it and a final centre crop trims to `target_shape`, so rotation/zoom
+        never leave black borders.
+
+    `crop` only affects val/test: when True, centre pad/crop to `target_shape`
+    (patch-level eval); when False (full-volume eval), keep native size so
+    sliding-window inference can tile the whole image — set DataLoader
+    batch_size to 1 because volumes then have different shapes.
     """
     image_keys = ["image1", "image2"]
     label_keys = ["label1", "label2"]
     all_keys   = image_keys + label_keys
 
-    # --- transforms shared across splits ---
-    base = [
-        # Reorient to RPI (adjust to your data) — ensures consistent orientation across subjects
+    # --- shared geometry: orient to RPI + resample to 1mm iso (every split) ---
+    pre = [
         T.Orientationd(keys=all_keys, axcodes="RPI", labels=(('L', 'R'), ('P', 'A'), ('I', 'S'))),
-        # Resample to 1mm iso
         T.Spacingd(keys=image_keys + label_keys, pixdim=(1.0, 1.0, 1.0),
                    mode=["bilinear"] * len(image_keys) + ["nearest"] * len(label_keys)),
     ]
-    if crop:
-        # Ensure uniform spatial size — adjust to your data
-        base.append(T.ResizeWithPadOrCropd(keys=all_keys, spatial_size=target_shape))
-    base += [
-        # Intensity normalise images only
-        T.NormalizeIntensityd(keys=image_keys, nonzero=True, channel_wise=True),
-        T.ToTensord(keys=all_keys),
-    ]
 
     if split == "train":
+        # Crop to an enlarged patch so rotation/zoom never introduce black borders.
+        initial = get_initial_patch_size(target_shape)
+        crop_tf = [
+            # Current timepoint: foreground-oversampled random crop.
+            # pos/(pos+neg) = oversample_rate → that fraction of patches are
+            # centred on a lesion voxel (nnU-Net oversample_foreground_percent).
+            T.SpatialPadd(keys=["image2", "label2"], spatial_size=initial),
+            T.RandCropByPosNegLabeld(
+                keys=["image2", "label2"], label_key="label2",
+                spatial_size=initial,
+                pos=oversample_rate, neg=1.0 - oversample_rate,
+                num_samples=1, allow_smaller=False,
+            ),
+            # Previous timepoint: centre pad/crop, used as fixed global context.
+            T.ResizeWithPadOrCropd(keys=["image1", "label1"], spatial_size=initial),
+        ]
+        normalise = [
+            # Intensity normalise images only
+            T.NormalizeIntensityd(keys=image_keys, nonzero=True, channel_wise=True),
+            T.ToTensord(keys=all_keys),
+        ]
         augment = [
             # ── Spatial (applied identically to both timepoints and labels) ───
             #
@@ -162,65 +211,48 @@ def get_transforms(split: str, target_shape=(64, 64, 160), crop: bool = True):
             # Gamma correction: gamma U(0.7, 1.5), p=0.3
             T.RandAdjustContrastd(keys=image_keys, gamma=(0.7, 1.5), prob=0.3),
         ]
-        return T.Compose(base + augment)
+        # Trim the augmented enlarged patch down to the final patch size.
+        final_crop = [T.CenterSpatialCropd(keys=all_keys, roi_size=target_shape)]
+        return T.Compose(pre + crop_tf + normalise + augment + final_crop)
 
+    # --- validation / test ---
+    base = list(pre)
+    if crop:
+        # Patch-level eval: centre pad/crop to a uniform size.
+        base.append(T.ResizeWithPadOrCropd(keys=all_keys, spatial_size=target_shape))
+    base += [
+        T.NormalizeIntensityd(keys=image_keys, nonzero=True, channel_wise=True),
+        T.ToTensord(keys=all_keys),
+    ]
     return T.Compose(base)
 
 
 # ------------------------------------------------------------------ #
-# 3. Foreground oversampling sampler
+# 3. Fixed-length sampler (nnU-Net-style epoch)
 # ------------------------------------------------------------------ #
 
-class ForegroundOversampledSampler(Sampler):
+class FixedLengthRandomSampler(Sampler):
     """
-    Produces len(dataset) indices per epoch, where a fixed fraction
-    (`oversample_rate`, default 0.33) are drawn from samples that contain
-    at least one foreground lesion voxel in the target label (label2).
-    The remaining indices are drawn uniformly at random from the full dataset.
+    Yields a fixed number of random indices (with replacement) per epoch, so an
+    "epoch" is a fixed number of iterations decoupled from the dataset size —
+    matching nnU-Net (num_iterations_per_epoch × batch_size samples per epoch,
+    1000 epochs).
 
-    This mirrors nnUNet's foreground oversampling strategy and helps the model
-    see lesion-positive samples more frequently — critical for small, sparse
-    MS lesions where many volumes may be lesion-free.
-
-    The foreground/background split is computed once at construction by
-    scanning all label2 files; subsequent epochs reuse this index.
+    Foreground oversampling is no longer the sampler's job: it is handled at the
+    patch level by RandCropByPosNegLabeld in get_transforms, which centres a
+    fraction of crops on a lesion voxel (closer to nnU-Net than picking whole
+    foreground-containing volumes, and it removes the startup label scan).
     """
 
-    def __init__(self, dataset: LongitudinalLesionDataset,
-                 label_key: str = "label2",
-                 oversample_rate: float = 0.33):
-        self.n           = len(dataset)
-        self.n_fg        = round(self.n * oversample_rate)
-        self.n_rnd       = self.n - self.n_fg
-
-        # Scan label files once to identify foreground samples
-        print(f"ForegroundOversampledSampler: scanning {self.n} label files …")
-        fg_indices, bg_indices = [], []
-        for i, entry in enumerate(dataset.samples):
-            vol = nib.load(entry[label_key]).get_fdata(dtype=np.float32)
-            (fg_indices if vol.max() > 0 else bg_indices).append(i)
-
-        if not fg_indices:
-            raise RuntimeError(
-                "ForegroundOversampledSampler: no foreground samples found. "
-                "Check that label2 files contain lesion voxels."
-            )
-
-        self.fg_indices  = np.array(fg_indices)
-        self.all_indices = np.arange(self.n)
-        print(f"  → {len(fg_indices)} foreground / {len(bg_indices)} background samples.")
+    def __init__(self, dataset_len: int, num_samples: int):
+        self.dataset_len = dataset_len
+        self.num_samples = num_samples
 
     def __iter__(self):
-        # Draw foreground-guaranteed indices (with replacement to handle small fg sets)
-        fg_draw  = np.random.choice(self.fg_indices, size=self.n_fg,  replace=True)
-        # Draw the rest uniformly from the full dataset (without replacement)
-        rnd_draw = np.random.choice(self.all_indices, size=self.n_rnd, replace=False)
-        indices  = np.concatenate([fg_draw, rnd_draw])
-        np.random.shuffle(indices)
-        return iter(indices.tolist())
+        return iter(np.random.randint(0, self.dataset_len, size=self.num_samples).tolist())
 
     def __len__(self) -> int:
-        return self.n
+        return self.num_samples
 
 
 # ------------------------------------------------------------------ #
@@ -252,14 +284,15 @@ def get_dataloaders(json_path: str,
                     batch_size: int = 2,
                     num_workers: int = 4,
                     oversample_rate: float = 0.33,
-                    eval_full_volume: bool = True):
+                    eval_full_volume: bool = True,
+                    num_iterations_per_epoch: int = 250):
     """
     Returns (train, val, test) DataLoaders.
 
-    The training loader uses ForegroundOversampledSampler so that
-    `oversample_rate` fraction of each epoch's samples are guaranteed to
-    contain at least one foreground lesion voxel (label2 > 0). Training always
-    operates on `target_shape` patches.
+    Training mirrors nnU-Net: each epoch is a fixed `num_iterations_per_epoch`
+    batches (FixedLengthRandomSampler), and `oversample_rate` of the patches are
+    centred on a lesion voxel via RandCropByPosNegLabeld in get_transforms.
+    Training always operates on `target_shape` patches.
 
     `eval_full_volume`: when True (default), the val/test loaders return whole
     volumes (no crop) at batch_size 1, so evaluation can use sliding-window
@@ -273,11 +306,14 @@ def get_dataloaders(json_path: str,
         ds = LongitudinalLesionDataset(
             json_path  = json_path,
             split      = split,
-            transform  = get_transforms(split, target_shape, crop=crop),
+            transform  = get_transforms(split, target_shape, crop=crop,
+                                        oversample_rate=oversample_rate),
         )
         if is_train:
-            sampler = ForegroundOversampledSampler(
-                ds, label_key="label2", oversample_rate=oversample_rate
+            # Fixed-length epoch (decoupled from dataset size); foreground
+            # oversampling is done at the patch level in get_transforms.
+            sampler = FixedLengthRandomSampler(
+                len(ds), num_samples=num_iterations_per_epoch * batch_size
             )
             loaders[split] = DataLoader(
                 ds,

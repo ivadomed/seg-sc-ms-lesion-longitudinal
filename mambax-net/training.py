@@ -18,77 +18,22 @@ from datetime import datetime
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import LambdaLR
 import numpy as np
 import nibabel as nib
 import wandb
-from monai.inferers import sliding_window_inference
-from monai.transforms import ResizeWithPadOrCrop
 from monai.utils import set_determinism
 
 from mambaxnet import MambaXNet
 from mambaxnet_v2 import MambaXNetV2
 from load_dataset import get_dataloaders
 from wandb_logging import log_validation_images
-from metrics import compute_all_metrics
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Loss
-# ──────────────────────────────────────────────────────────────────────────────
-
-class DiceLoss(nn.Module):
-    def __init__(self, n_classes: int, smooth: float = 1e-5):
-        super().__init__()
-        self.n_classes = n_classes
-        self.smooth = smooth
-
-    def forward(self, preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        probs = torch.softmax(preds, dim=1)
-        targets_oh = torch.zeros_like(probs)
-        targets_oh.scatter_(1, targets.unsqueeze(1).long(), 1.0)
-
-        probs_flat = probs.view(probs.shape[0], probs.shape[1], -1)
-        tgt_flat   = targets_oh.view(*probs_flat.shape)
-
-        intersection = (probs_flat * tgt_flat).sum(-1)
-        union        = probs_flat.sum(-1) + tgt_flat.sum(-1)
-
-        dice = (2.0 * intersection + self.smooth) / (union + self.smooth)
-        return 1.0 - dice[:, 1:].mean()
-
-
-class CombinedLoss(nn.Module):
-    def __init__(self, n_classes: int):
-        super().__init__()
-        self.dice = DiceLoss(n_classes)
-        self.ce   = nn.CrossEntropyLoss()
-
-    def forward(self, preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        return self.dice(preds, targets) + self.ce(preds, targets.long())
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Metrics
-# ──────────────────────────────────────────────────────────────────────────────
-
-def compute_dice(preds: torch.Tensor, targets: torch.Tensor,
-                 n_classes: int, smooth: float = 1e-5) -> float:
-    pred_labels = preds.argmax(dim=1)
-    dice_scores = []
-    for cls in range(1, n_classes):
-        pred_c = (pred_labels == cls).float().view(-1)
-        tgt_c  = (targets == cls).float().view(-1)
-        inter  = (pred_c * tgt_c).sum()
-        denom  = pred_c.sum() + tgt_c.sum()
-        if denom == 0:
-            # empty GT and empty prediction for this class → perfect
-            dice_scores.append(1.0)
-            continue
-        dice_scores.append(((2.0 * inter + smooth) / (denom + smooth)).item())
-    return float(np.mean(dice_scores)) if dice_scores else 0.0
-
+from metrics import compute_all_metrics, compute_dice
+from loss import CombinedLoss, DeepSupervisionLoss, DiceLoss
+from debuging import save_batch_patches
+from utils import PolyLRScheduler
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Forward pass
@@ -111,82 +56,6 @@ def forward_pair(model: nn.Module, batch: dict, device: torch.device,
     return preds, targets
 
 
-def build_sw_predictor(model: nn.Module, roi_size, sw_batch_size: int = 2,
-                       overlap: float = 0.5, zero_prev_mask: bool = False):
-    """Return a full-volume predictor using MONAI sliding-window inference.
-
-    The two timepoints are unregistered and natively differently sized, so they
-    CANNOT be concatenated and windowed jointly. Instead we slide the window
-    over the CURRENT image only and feed the previous timepoint as fixed global
-    context: it is centre pad/cropped to `roi_size` (exactly as the training
-    transform does to both timepoints) and reused for every window. M-CAM's
-    cross-attention handles the differing token counts, so this is valid.
-
-    Note: the previous-timepoint encoder is recomputed for every window — fine
-    for validation. For volumes that fit within roi_size (after the 1mm
-    resample), there is a single window and this matches training exactly.
-    """
-    _resize = ResizeWithPadOrCrop(spatial_size=roi_size)
-
-    def predict(i_t, i_prev, m_prev):
-        assert i_t.shape[0] == 1, "full-volume predictor expects batch_size 1"
-        if zero_prev_mask:
-            m_prev = torch.zeros_like(m_prev)
-
-        # Fixed previous-timepoint context at roi_size (channel-first per item).
-        i_prev_ctx = _resize(i_prev[0]).unsqueeze(0)            # (1, 1, *roi)
-        m_prev_ctx = _resize(m_prev[0]).unsqueeze(0)            # (1, 1, *roi)
-
-        def _net(window):                                      # (sw, 1, *roi)
-            b = window.shape[0]
-            ip = i_prev_ctx.repeat(b, 1, 1, 1, 1)
-            mp = m_prev_ctx.repeat(b, 1, 1, 1, 1)
-            return model(window, ip, mp)
-
-        return sliding_window_inference(
-            i_t, roi_size, sw_batch_size, _net, overlap=overlap, mode="gaussian"
-        )
-
-    return predict
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Debug — save the patches seen by the model
-# ──────────────────────────────────────────────────────────────────────────────
-
-def save_batch_patches(batch: dict, out_dir: str):
-    """
-    Dump every volume in a batch (image1/label1/image2/label2) to NIfTI so the
-    exact patches fed to the model can be inspected. Affine is taken from the
-    MetaTensor when available, otherwise identity.
-    """
-    os.makedirs(out_dir, exist_ok=True)
-    keys = ["image1", "label1", "image2", "label2"]
-    bsz  = batch["image1"].shape[0]
-
-    for b in range(bsz):
-        subject  = batch.get("subject",  ["unknown"] * bsz)[b]
-        session1 = batch.get("session1", ["s1"] * bsz)[b]
-        session2 = batch.get("session2", ["s2"] * bsz)[b]
-        prefix   = f"b{b}_{subject}_{session1}_{session2}"
-
-        for key in keys:
-            vol = batch[key][b]                       # (1, H, W, D)
-            arr = vol.squeeze(0).detach().cpu().numpy().astype(np.float32)
-
-            # Recover the affine from the MONAI MetaTensor if present
-            affine = getattr(vol, "affine", None)
-            if affine is not None:
-                affine = affine.detach().cpu().numpy()
-            else:
-                affine = np.eye(4)
-
-            path = os.path.join(out_dir, f"{prefix}_{key}.nii.gz")
-            nib.save(nib.Nifti1Image(arr, affine), path)
-
-        logger.info(f"Saved debug patches for sample {b} ({subject}) → {out_dir}")
-
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Train / validate
 # ──────────────────────────────────────────────────────────────────────────────
@@ -194,6 +63,7 @@ def save_batch_patches(batch: dict, out_dir: str):
 def train_one_epoch(model, loader, optimizer, criterion, device, n_classes, epoch, global_step, scaler,
                     zero_prev_mask=False):
     model.train()
+    model.deep_supervision = True   # multi-scale outputs for the deep-supervised loss
     total_loss = 0.0
     total_dice = 0.0
 
@@ -210,7 +80,9 @@ def train_one_epoch(model, loader, optimizer, criterion, device, n_classes, epoc
         scaler.update()
 
         with torch.no_grad():
-            dice = compute_dice(preds.detach(), targets, n_classes)
+            # Deep supervision returns a list (highest-res first); score the finest.
+            finest = preds[0] if isinstance(preds, (list, tuple)) else preds
+            dice = compute_dice(finest.detach(), targets, n_classes)
 
         total_loss += loss.item()
         total_dice += dice
@@ -226,27 +98,26 @@ def train_one_epoch(model, loader, optimizer, criterion, device, n_classes, epoc
 
 
 @torch.no_grad()
-def validate(model, loader, criterion, device, predict_fn, overlap_ratio: float = 0.1):
-    """Full-volume validation via sliding-window inference.
+def validate(model, loader, criterion, device, overlap_ratio: float = 0.1,
+             zero_prev_mask: bool = False):
+    """Patch-level validation: forward the (centre-cropped) validation patches
+    directly and average the loss + overlap/lesion metrics. No sliding window.
 
     Returns a dict of mean metrics over the validation set:
         loss, dice, lesion_f1, lesion_ppv, lesion_sensitivity
-    plus dice_nonempty (Dice averaged only over volumes whose GT has lesions —
+    plus dice_nonempty (Dice averaged only over patches whose GT has lesions —
     this is the honest overlap number, since empty/empty cases score Dice 1.0
     and otherwise inflate the mean).
     """
     model.eval()
+    model.deep_supervision = False   # single full-res output (no deep supervision)
     agg = {k: [] for k in
            ("loss", "dice", "lesion_f1", "lesion_ppv", "lesion_sensitivity")}
     dice_nonempty = []
 
     for batch in loader:
-        i_t    = batch["image2"].to(device)
-        i_prev = batch["image1"].to(device)
-        m_prev = batch["label1"].to(device)
-        targets = batch["label2"].squeeze(1).to(device)        # (B, *spatial)
-
-        logits = predict_fn(i_t, i_prev, m_prev)               # (B, C, *spatial)
+        logits, targets = forward_pair(model, batch, device,
+                                       zero_prev_mask=zero_prev_mask)  # (B, C, *spatial)
         agg["loss"].append(criterion(logits, targets).item())
 
         pred_labels = logits.argmax(dim=1)                     # (B, *spatial)
@@ -265,35 +136,6 @@ def validate(model, loader, criterion, device, predict_fn, overlap_ratio: float 
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# LR scheduler
-# ──────────────────────────────────────────────────────────────────────────────
-
-class PolyLRScheduler(LambdaLR):
-    """
-    Polynomial LR decay — identical to nnUNet's PolyLRScheduler.
-
-        lr = initial_lr × (1 - epoch / max_epochs) ^ exponent
-
-    The LR decreases slowly for most of training and drops sharply near the
-    end, which empirically outperforms cosine annealing for segmentation tasks.
-
-    Args:
-        optimizer   : the SGD (or any) optimizer
-        max_epochs  : total number of training epochs
-        exponent    : polynomial exponent (nnUNet default: 0.9)
-    """
-    def __init__(self, optimizer: optim.Optimizer,
-                 max_epochs: int, exponent: float = 0.9):
-        self.max_epochs = max_epochs
-        self.exponent   = exponent
-        super().__init__(optimizer, lr_lambda=self._factor)
-
-    def _factor(self, epoch: int) -> float:
-        # epoch is 0-indexed inside LambdaLR
-        return (1 - epoch / self.max_epochs) ** self.exponent
-
-
-# ──────────────────────────────────────────────────────────────────────────────
 # CLI
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -302,7 +144,11 @@ def parse_args():
     parser.add_argument("--unet",           type=str, required=True)
     parser.add_argument("--data",           type=str, required=True)
     parser.add_argument("--output",         type=str, required=True)
-    parser.add_argument("--epochs",         type=int,   default=200)
+    parser.add_argument("--epochs",         type=int,   default=1000,
+                        help="Number of epochs (nnU-Net default: 1000).")
+    parser.add_argument("--iters-per-epoch", type=int,  default=250,
+                        help="Training minibatches per epoch (nnU-Net default: "
+                             "250). An epoch is decoupled from the dataset size.")
     parser.add_argument("--lr",             type=float, default=1e-2)
     parser.add_argument("--n_classes",      type=int,   default=2)
     parser.add_argument("--wandb_project",  type=str,   default="mambaxnet-longitudinal")
@@ -318,13 +164,11 @@ def parse_args():
                         help="Ablation: zero the previous-timepoint mask everywhere "
                              "(train + eval) to measure reliance on the prior.")
     parser.add_argument("--roi-size", type=int, nargs=3, default=[64, 64, 160],
-                        help="Sliding-window ROI for full-volume validation (RPI order).")
-    parser.add_argument("--sw-overlap", type=float, default=0.5,
-                        help="Sliding-window overlap fraction for validation.")
+                        help="Patch size for training and validation (RPI order).")
     parser.add_argument("--overlap-ratio", type=float, default=0.1,
                         help="Lesion-wise detection overlap threshold (fraction).")
     parser.add_argument("--val-interval", type=int, default=1,
-                        help="Run (expensive) full-volume validation every N epochs.")
+                        help="Run patch-level validation every N epochs.")
     parser.add_argument("--best-metric", type=str, default="lesion_f1",
                         choices=["lesion_f1", "dice", "dice_nonempty",
                                  "lesion_sensitivity", "lesion_ppv"],
@@ -370,10 +214,11 @@ def main():
 
     roi_size = tuple(args.roi_size)
     logger.info("Loading dataset …")
-    # Train on patches; validate on full volumes (sliding-window) → eval_full_volume.
+    # Train and validate on patches (validation = centre crop to roi_size).
     train_loader, val_loader, _ = get_dataloaders(
-        json_path=args.data, batch_size=2, target_shape=roi_size, eval_full_volume=True)
-    logger.info(f"Train batches: {len(train_loader)} | Val volumes: {len(val_loader)}")
+        json_path=args.data, batch_size=2, target_shape=roi_size, eval_full_volume=False,
+        num_iterations_per_epoch=args.iters_per_epoch)
+    logger.info(f"Train batches: {len(train_loader)} | Val batches: {len(val_loader)}")
     if args.zero_prev_mask:
         logger.info("ABLATION: previous-timepoint mask zeroed (train + eval).")
 
@@ -399,7 +244,23 @@ def main():
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"Trainable parameters: {n_params:,}")
 
-    criterion = CombinedLoss(n_classes=args.n_classes)
+    # nnU-Net loss: Dice (batch_dice from plans.json) + CE, applied with deep
+    # supervision across decoder resolutions.
+    with open(plans_json) as f:
+        _plans = json.load(f)
+    batch_dice = bool(_plans["configurations"]["3d_fullres"].get("batch_dice", True))
+    base_criterion = CombinedLoss(n_classes=args.n_classes, batch_dice=batch_dice)
+
+    # Deep-supervision weights: 1, 1/2, 1/4, … one per decoder output, with the
+    # coarsest level dropped (weight 0) then normalised — identical to nnU-Net.
+    n_ds = len(model.seg_layers)
+    ds_weights = np.array([1 / (2 ** i) for i in range(n_ds)], dtype=float)
+    ds_weights[-1] = 0.0
+    ds_weights = ds_weights / ds_weights.sum()
+    criterion = DeepSupervisionLoss(base_criterion, ds_weights)
+    logger.info(f"Loss: Dice(batch_dice={batch_dice})+CE | deep-supervision "
+                f"weights {np.round(ds_weights, 3).tolist()}")
+
     optimizer = optim.SGD(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr           = args.lr,
@@ -411,10 +272,6 @@ def main():
     scaler    = torch.cuda.amp.GradScaler()
     logger.info(f"SGD | lr={args.lr} | momentum=0.99 | weight_decay=3e-5 | nesterov=True")
     logger.info(f"PolyLR | exponent=0.9 | max_epochs={args.epochs}")
-
-    # Full-volume predictor used for validation + W&B image logging.
-    predict_fn = build_sw_predictor(
-        model, roi_size=roi_size, overlap=args.sw_overlap, zero_prev_mask=args.zero_prev_mask)
 
     if args.debug_save_patches:
         debug_dir = os.path.join(output_path, "debug_patches")
@@ -450,12 +307,13 @@ def main():
             "lr":               current_lr,
         }, step=global_step)
 
-        # Full-volume validation is expensive — run every --val-interval epochs.
+        # Patch-level validation — run every --val-interval epochs.
         run_val = (epoch % args.val_interval == 0) or (epoch == args.epochs)
         if run_val:
-            val = validate(model, val_loader, criterion, device, predict_fn,
-                           overlap_ratio=args.overlap_ratio)
-            log_validation_images(model, val_loader, device, global_step, predict_fn=predict_fn)
+            val = validate(model, val_loader, criterion, device,
+                           overlap_ratio=args.overlap_ratio,
+                           zero_prev_mask=args.zero_prev_mask)
+            log_validation_images(model, val_loader, device, global_step)
 
             elapsed = time.perf_counter() - t0
             logger.info(
