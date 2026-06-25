@@ -97,15 +97,12 @@ class MCAM(nn.Module):
         mamba_kwargs:  forwarded to MambaBlock (d_state, d_conv, expand)
     """
 
-    def __init__(self, in_channels: int, embed_dim: int = 128, num_heads: int = 2, sem_channels: int = 32, mamba_kwargs: dict | None = None, patch_size: int = 4,):
+    def __init__(self, in_channels: int, embed_dim: int = 128, num_heads: int = 2, sem_channels: int = 32, mamba_kwargs: dict | None = None,):
         super().__init__()
 
         # --- Patch embeddings ---
-        # patch_size controls the strided 3D conv that tokenises the feature
-        # map. Use a smaller value (e.g. 1) at coarse/bottleneck resolutions
-        # where the spatial extent is already < the default patch_size.
-        self.patch_embed_t   = PatchEmbedding3D(in_channels, embed_dim, patch_size)
-        self.patch_embed_tm1 = PatchEmbedding3D(in_channels, embed_dim, patch_size)
+        self.patch_embed_t   = PatchEmbedding3D(in_channels, embed_dim)
+        self.patch_embed_tm1 = PatchEmbedding3D(in_channels, embed_dim)
         # --- SEM fusion ---
         self.sem_proj      = nn.Linear(sem_channels, embed_dim)
         self.sem_fuse_conv = nn.Conv2d(embed_dim, embed_dim, kernel_size=1)
@@ -123,7 +120,7 @@ class MCAM(nn.Module):
         )
 
         # --- Unpack back to spatial ---
-        self.unpack = UnpackEmbedding(embed_dim, in_channels, patch_size)
+        self.unpack = UnpackEmbedding(embed_dim, in_channels)
 
         # --- Final activation ---
         self.relu = nn.ReLU(inplace=True)
