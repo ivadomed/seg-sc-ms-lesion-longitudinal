@@ -1,0 +1,175 @@
+"""
+Takes a BIDS dataset and produces an affine-registered version where all
+follow-up sessions are registered to each subject's baseline session.
+
+Steps per subject:
+  1. Segment spinal cord (sct_deepseg spinalcord)
+  2. Detect disc labels (sct_deepseg spine)
+  3. Register each follow-up to baseline (sct_register_multimodal)
+  4. Apply the warping field to lesion segmentations (sct_apply_transfo)
+
+Arguments:
+    -i: Path to the source BIDS dataset
+    -o: Path for the registered output dataset (created if absent)
+
+Author: Pierre-Louis Benveniste
+"""
+
+import argparse
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+
+import tqdm
+
+
+def run(cmd: str):
+    """Run a shell command, raising on failure."""
+    print(f"  >> {cmd}")
+    subprocess.run(cmd, shell=True, check=True)
+
+
+def find_subjects(bids_root: Path) -> dict:
+    """Return {subject_id: sorted list of (session_dir, image_path, label_path|None)}."""
+    subjects = {}
+    for img in sorted(bids_root.glob("sub-*/ses-*/anat/*.nii.gz")):
+        if "_lesion" in img.name or "_seg" in img.name or "_label" in img.name:
+            continue
+        sub = img.parts[-4]
+        stem = img.name.replace(".nii.gz", "")
+        label = img.parent / f"{stem}_lesion-manual.nii.gz"
+        if not label.exists():
+            label = img.parent / f"{stem}_lesion.nii.gz"
+        if not label.exists():
+            label = None
+        subjects.setdefault(sub, []).append((img.parent, img, label))
+    for sub in subjects:
+        subjects[sub].sort(key=lambda x: x[0].name)
+    return subjects
+
+
+def segment_sc(image: Path, output: Path):
+    """Segment spinal cord."""
+    run(f"SCT_USE_GPU=1 sct_deepseg spinalcord -i {image} -o {output}")
+
+
+def segment_discs(image: Path, output: Path):
+    """Detect disc labels. The actual disc file is output with _totalspineseg_discs suffix."""
+    run(f"SCT_USE_GPU=1 sct_deepseg spine -i {image} -o {output}")
+
+
+def get_disc_file(output: Path) -> Path:
+    """Return the _totalspineseg_discs.nii.gz file produced by sct_deepseg spine."""
+    stem = output.name.replace(".nii.gz", "")
+    return output.parent / f"{stem}_totalspineseg_discs.nii.gz"
+
+
+def register(moving_img, fixed_img, moving_seg, fixed_seg, moving_disc, fixed_disc, output):
+    """Affine registration of moving to fixed using SC seg and disc labels."""
+    run(
+        f"sct_register_multimodal"
+        f" -i {moving_img}"
+        f" -d {fixed_img}"
+        f" -iseg {moving_seg}"
+        f" -dseg {fixed_seg}"
+        f" -ilabel {moving_disc}"
+        f" -dlabel {fixed_disc}"
+        f" -o {output}"
+        f" -param step=0,type=label,algo=affine,metric=MeanSquares,slicewise=0,iter=0"
+        f":step=1,type=label,algo=affine,metric=MeanSquares,slicewise=0"
+    )
+
+
+def apply_transfo(input_file, dest_file, warp_field, output_file):
+    """Apply warping field to a label image."""
+    run(
+        f"sct_apply_transfo"
+        f" -i {input_file}"
+        f" -d {dest_file}"
+        f" -w {warp_field}"
+        f" -o {output_file}"
+        f" -x nn"
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Affine-register a BIDS dataset to baseline sessions.")
+    parser.add_argument("-i", required=True, help="Path to source BIDS dataset")
+    parser.add_argument("-o", required=True, help="Path to output registered dataset")
+    args = parser.parse_args()
+
+    bids_root = Path(args.i)
+    out_root = Path(args.o)
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    subjects = find_subjects(bids_root)
+    print(f"Found {len(subjects)} subjects")
+
+    for sub, sessions in tqdm.tqdm(subjects.items(), desc="Subjects"):
+        if len(sessions) < 2:
+            print(f"  Skipping {sub}: only {len(sessions)} session(s)")
+            continue
+
+        baseline_dir, baseline_img, baseline_label = sessions[0]
+        baseline_ses = baseline_dir.name
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+
+            # --- Segment baseline ---
+            baseline_sc_seg = tmpdir / f"{baseline_img.stem.replace('.nii', '')}_sc-seg.nii.gz"
+            segment_sc(baseline_img, baseline_sc_seg)
+
+            baseline_disc_out = tmpdir / f"{baseline_img.stem.replace('.nii', '')}_disc-labels.nii.gz"
+            segment_discs(baseline_img, baseline_disc_out)
+            baseline_disc = get_disc_file(baseline_disc_out)
+
+            # --- Copy baseline to output as-is ---
+            out_baseline_anat = out_root / sub / baseline_ses / "anat"
+            out_baseline_anat.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(baseline_img, out_baseline_anat / baseline_img.name)
+            if baseline_label:
+                shutil.copy2(baseline_label, out_baseline_anat / baseline_label.name)
+
+            # --- Process each follow-up ---
+            for ses_dir, fu_img, fu_label in sessions[1:]:
+                fu_ses = ses_dir.name
+
+                # Segment follow-up
+                fu_sc_seg = tmpdir / f"{fu_img.stem.replace('.nii', '')}_sc-seg.nii.gz"
+                segment_sc(fu_img, fu_sc_seg)
+
+                fu_disc_out = tmpdir / f"{fu_img.stem.replace('.nii', '')}_disc-labels.nii.gz"
+                segment_discs(fu_img, fu_disc_out)
+                fu_disc = get_disc_file(fu_disc_out)
+
+                # Register follow-up to baseline
+                fu_stem = fu_img.stem.replace(".nii", "")
+                reg_output = tmpdir / f"{fu_stem}_reg.nii.gz"
+                register(fu_img, baseline_img, fu_sc_seg, baseline_sc_seg, fu_disc, baseline_disc, reg_output)
+
+                # Find the warping field produced by sct_register_multimodal
+                warp_field = tmpdir / f"warp_{fu_img.name.replace('.nii.gz', '')}2{baseline_img.name.replace('.nii.gz', '')}.nii.gz"
+                if not warp_field.exists():
+                    # Try alternative naming in current directory
+                    warp_field = Path(f"warp_{fu_img.name.replace('.nii.gz', '')}2{baseline_img.name.replace('.nii.gz', '')}.nii.gz")
+
+                # Output directory
+                out_fu_anat = out_root / sub / fu_ses / "anat"
+                out_fu_anat.mkdir(parents=True, exist_ok=True)
+
+                # Copy registered image
+                shutil.copy2(reg_output, out_fu_anat / fu_img.name)
+
+                # Apply warping field to lesion label if it exists
+                if fu_label and warp_field.exists():
+                    reg_label = tmpdir / f"{fu_label.stem.replace('.nii', '')}_reg.nii.gz"
+                    apply_transfo(fu_label, baseline_img, warp_field, reg_label)
+                    shutil.copy2(reg_label, out_fu_anat / fu_label.name)
+
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()
