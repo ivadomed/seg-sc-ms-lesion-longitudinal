@@ -87,11 +87,15 @@ def compute_dice(preds: torch.Tensor, targets: torch.Tensor,
 # Forward pass
 # ──────────────────────────────────────────────────────────────────────────────
 
-def forward_pair(model: nn.Module, batch: dict, device: torch.device):
+def forward_pair(model: nn.Module, batch: dict, device: torch.device,
+                 empty_prior_mask: bool = False):
     image1 = batch["image1"].to(device)   # (B, 1, *spatial) — t-1
     label1 = batch["label1"].to(device)   # (B, 1, *spatial) — t-1 mask
     image2 = batch["image2"].to(device)   # (B, 1, *spatial) — t
     label2 = batch["label2"].to(device)   # (B, 1, *spatial) — t target
+
+    if empty_prior_mask:
+        label1 = torch.zeros_like(label1)
 
     targets = label2.squeeze(1)            # (B, *spatial)
     preds   = model(image2, image1, label1)
@@ -139,16 +143,17 @@ def save_batch_patches(batch: dict, out_dir: str):
 # Train / validate
 # ──────────────────────────────────────────────────────────────────────────────
 
-def train_one_epoch(model, loader, optimizer, criterion, device, n_classes, epoch, global_step, scaler):
+def train_one_epoch(model, loader, optimizer, criterion, device, n_classes, epoch, global_step, scaler,
+                    empty_prior_mask=False):
     model.train()
     total_loss = 0.0
     total_dice = 0.0
 
     for batch_idx, batch in enumerate(loader):
         optimizer.zero_grad()
-        
+
         with torch.autocast(device_type=device.type):
-            preds, targets = forward_pair(model, batch, device)
+            preds, targets = forward_pair(model, batch, device, empty_prior_mask=empty_prior_mask)
             loss = criterion(preds, targets)
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -173,13 +178,13 @@ def train_one_epoch(model, loader, optimizer, criterion, device, n_classes, epoc
 
 
 @torch.no_grad()
-def validate(model, loader, criterion, device, n_classes):
+def validate(model, loader, criterion, device, n_classes, empty_prior_mask=False):
     model.eval()
     total_loss = 0.0
     total_dice = 0.0
 
     for batch in loader:
-        preds, targets = forward_pair(model, batch, device)
+        preds, targets = forward_pair(model, batch, device, empty_prior_mask=empty_prior_mask)
         total_loss += criterion(preds, targets).item()
         total_dice += compute_dice(preds, targets, n_classes)
 
@@ -232,6 +237,8 @@ def parse_args():
     parser.add_argument("--wandb_offline",    action="store_true")
     parser.add_argument("--freeze-encoder",   action="store_true",
                         help="Freeze encoder weights (stem + all stages).")
+    parser.add_argument("--empty-prior-mask",    action="store_true",
+                        help="Zero out the previous-timepoint mask (label1) to measure its contribution.")
     parser.add_argument("--debug-save-patches", action="store_true",
                         help="Save the first training batch's patches as NIfTI, then stop.")
     return parser.parse_args()
@@ -257,6 +264,8 @@ def main():
         os.environ["WANDB_MODE"] = "offline"
     wandb.init(project=args.wandb_project, name=args.wandb_run, config=vars(args), dir=output_path)
     logger.info(f"W&B run: {wandb.run.name}")
+    if args.empty_prior_mask:
+        logger.info("Empty prior mask mode: label1 will be zeroed out.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Device: {device}")
@@ -317,10 +326,12 @@ def main():
         t0 = time.perf_counter()
 
         train_loss, train_dice, global_step = train_one_epoch(
-            model, train_loader, optimizer, criterion, device, args.n_classes, epoch, global_step, scaler
+            model, train_loader, optimizer, criterion, device, args.n_classes, epoch, global_step, scaler,
+            empty_prior_mask=args.empty_prior_mask,
         )
         val_loss, val_dice = validate(
-            model, val_loader, criterion, device, args.n_classes
+            model, val_loader, criterion, device, args.n_classes,
+            empty_prior_mask=args.empty_prior_mask,
         )
         log_validation_images(model, val_loader, device, global_step)
 
