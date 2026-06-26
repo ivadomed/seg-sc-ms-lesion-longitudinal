@@ -44,8 +44,10 @@ def find_cases(bids_root: Path, canproco: bool, exclude_canproco: Path = None, b
         # Remove the session from the subjects to exclude
         subjects_to_remove = [sub.split("_")[0] for sub in subjects_to_remove]
         list_images = [img for img in list_images if img.parts[-4] not in subjects_to_remove]
-    
-    
+    if bavaria:
+        to_exclude_bavaria = ["sub-m315309_ses-20170510_acq-ax_chunk-4_T2w.nii.gz"]
+        list_images = [img for img in list_images if img.name not in to_exclude_bavaria]
+
     for img in list_images:
         stem  = img.name.replace(".nii.gz", "")
         lbl   = (bids_root / "derivatives" / "labels"
@@ -76,9 +78,14 @@ def find_cases(bids_root: Path, canproco: bool, exclude_canproco: Path = None, b
 
 def process_case(image_path, label_path, src_root, dst_root, pad,tmp_dir):
     """Detect SC, crop image and label, run QC. Returns (qc | None, error | None)."""
-    bbox = detect(image_path, **pad)
 
+    # Build output paths
     dst_image = dst_root / image_path.relative_to(src_root)
+    if dst_image.exists():
+        print(f"Skipping {dst_image} (already exists)")
+        return None
+    
+    bbox = detect(image_path, **pad)
     dst_image.parent.mkdir(parents=True, exist_ok=True)
     nib.save(crop(nib.load(image_path), bbox), dst_image)
 
