@@ -88,7 +88,7 @@ def compute_dice(preds: torch.Tensor, targets: torch.Tensor,
 # ──────────────────────────────────────────────────────────────────────────────
 
 def forward_pair(model: nn.Module, batch: dict, device: torch.device,
-                 empty_prior_mask: bool = False):
+                 empty_prior_mask: bool = False, empty_prior_image: bool = False):
     image1 = batch["image1"].to(device)   # (B, 1, *spatial) — t-1
     label1 = batch["label1"].to(device)   # (B, 1, *spatial) — t-1 mask
     image2 = batch["image2"].to(device)   # (B, 1, *spatial) — t
@@ -96,6 +96,8 @@ def forward_pair(model: nn.Module, batch: dict, device: torch.device,
 
     if empty_prior_mask:
         label1 = torch.zeros_like(label1)
+    if empty_prior_image:
+        image1 = torch.zeros_like(image1)
 
     targets = label2.squeeze(1)            # (B, *spatial)
     preds   = model(image2, image1, label1)
@@ -144,7 +146,7 @@ def save_batch_patches(batch: dict, out_dir: str):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def train_one_epoch(model, loader, optimizer, criterion, device, n_classes, epoch, global_step, scaler,
-                    empty_prior_mask=False):
+                    empty_prior_mask=False, empty_prior_image=False):
     model.train()
     total_loss = 0.0
     total_dice = 0.0
@@ -153,7 +155,8 @@ def train_one_epoch(model, loader, optimizer, criterion, device, n_classes, epoc
         optimizer.zero_grad()
 
         with torch.autocast(device_type=device.type):
-            preds, targets = forward_pair(model, batch, device, empty_prior_mask=empty_prior_mask)
+            preds, targets = forward_pair(model, batch, device, empty_prior_mask=empty_prior_mask,
+                                                     empty_prior_image=empty_prior_image)
             loss = criterion(preds, targets)
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -178,13 +181,14 @@ def train_one_epoch(model, loader, optimizer, criterion, device, n_classes, epoc
 
 
 @torch.no_grad()
-def validate(model, loader, criterion, device, n_classes, empty_prior_mask=False):
+def validate(model, loader, criterion, device, n_classes, empty_prior_mask=False, empty_prior_image=False):
     model.eval()
     total_loss = 0.0
     total_dice = 0.0
 
     for batch in loader:
-        preds, targets = forward_pair(model, batch, device, empty_prior_mask=empty_prior_mask)
+        preds, targets = forward_pair(model, batch, device, empty_prior_mask=empty_prior_mask,
+                                             empty_prior_image=empty_prior_image)
         total_loss += criterion(preds, targets).item()
         total_dice += compute_dice(preds, targets, n_classes)
 
@@ -239,6 +243,8 @@ def parse_args():
                         help="Freeze encoder weights (stem + all stages).")
     parser.add_argument("--empty-prior-mask",    action="store_true",
                         help="Zero out the previous-timepoint mask (label1) to measure its contribution.")
+    parser.add_argument("--empty-prior-image",   action="store_true",
+                        help="Zero out the previous-timepoint image (image1) to measure its contribution.")
     parser.add_argument("--debug-save-patches", action="store_true",
                         help="Save the first training batch's patches as NIfTI, then stop.")
     return parser.parse_args()
@@ -266,6 +272,8 @@ def main():
     logger.info(f"W&B run: {wandb.run.name}")
     if args.empty_prior_mask:
         logger.info("Empty prior mask mode: label1 will be zeroed out.")
+    if args.empty_prior_image:
+        logger.info("Empty prior image mode: image1 will be zeroed out.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Device: {device}")
@@ -328,10 +336,12 @@ def main():
         train_loss, train_dice, global_step = train_one_epoch(
             model, train_loader, optimizer, criterion, device, args.n_classes, epoch, global_step, scaler,
             empty_prior_mask=args.empty_prior_mask,
+            empty_prior_image=args.empty_prior_image,
         )
         val_loss, val_dice = validate(
             model, val_loader, criterion, device, args.n_classes,
             empty_prior_mask=args.empty_prior_mask,
+            empty_prior_image=args.empty_prior_image,
         )
         log_validation_images(model, val_loader, device, global_step)
 
