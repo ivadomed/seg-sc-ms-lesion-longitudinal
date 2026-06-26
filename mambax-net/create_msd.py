@@ -101,7 +101,7 @@ def build_longitudinal_pairs(derivatives: list, site: str) -> list:
             image1_path = str(label1_path).replace('_label-lesion_seg.nii.gz', '.nii.gz').replace('derivatives/labels/', '')
             image2_path = str(label2_path).replace('_label-lesion_seg.nii.gz', '.nii.gz').replace('derivatives/labels/', '')
 
-            if site=="canproco":
+            if site=="canproco" or site=="bavaria":
                 image1_path = str(label1_path).replace('_lesion-manual.nii.gz', '.nii.gz').replace('derivatives/labels/', '')
                 image2_path = str(label2_path).replace('_lesion-manual.nii.gz', '.nii.gz').replace('derivatives/labels/', '')
 
@@ -198,7 +198,7 @@ def main():
     all_pairs = []
     for data_path, site in zip(data_paths, sites):
         derivatives = list(Path(data_path).rglob('*_label-lesion_seg.nii.gz'))
-        if site=="canproco":
+        if site=="canproco" or site=="bavaria":
             derivatives = list(Path(data_path).rglob('*_lesion-manual.nii.gz'))
         logger.info(f"[{site}] Found {len(derivatives)} label files under {data_path}")
         site_pairs = build_longitudinal_pairs(derivatives, site=site)
