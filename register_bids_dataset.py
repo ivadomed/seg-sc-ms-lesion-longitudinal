@@ -34,15 +34,17 @@ def find_subjects(bids_root: Path) -> dict:
     """Return {subject_id: sorted list of (session_dir, image_path, label_path|None)}."""
     subjects = {}
     for img in sorted(bids_root.glob("sub-*/ses-*/anat/*.nii.gz")):
-        if "_lesion" in img.name or "_seg" in img.name or "_label" in img.name:
+        if "derivatives" in img.parts:
             continue
         sub = img.parts[-4]
         stem = img.name.replace(".nii.gz", "")
-        label = img.parent / f"{stem}_lesion-manual.nii.gz"
+        # the label is the BIDS folder but folder derivatives/labels/ and then the relative path to the image, with the suffix _label-lesion_seg.nii.gz
+        label = bids_root / "derivatives" / "labels" / img.relative_to(bids_root).parent / f"{stem}_label-lesion_seg.nii.gz"
         if not label.exists():
-            label = img.parent / f"{stem}_lesion.nii.gz"
+            label = bids_root / "derivatives" / "labels" / img.relative_to(bids_root).parent / f"{stem}_lesion-manual.nii.gz"
         if not label.exists():
-            label = None
+            # This is image has no label, we don't include the image in the list of cases
+            continue
         subjects.setdefault(sub, []).append((img.parent, img, label))
     for sub in subjects:
         subjects[sub].sort(key=lambda x: x[0].name)
@@ -63,6 +65,14 @@ def get_disc_file(output: Path) -> Path:
     """Return the _totalspineseg_discs.nii.gz file produced by sct_deepseg spine."""
     stem = output.name.replace(".nii.gz", "")
     return output.parent / f"{stem}_totalspineseg_discs.nii.gz"
+
+
+def keep_common_levels_only(levels_1, levels_2):
+    """
+    This function keeps only the common disc levels between two level segmentations.
+    """
+    run(f"sct_label_utils -i {levels_1} -remove-sym {levels_2} -o {levels_1},{levels_2}")
+    return None
 
 
 def register(moving_img, fixed_img, moving_seg, fixed_seg, moving_disc, fixed_disc, output):
@@ -114,6 +124,19 @@ def main():
         baseline_dir, baseline_img, baseline_label = sessions[0]
         baseline_ses = baseline_dir.name
 
+        # --- Check if all output files already exist ---
+        out_baseline_anat = out_root / sub / baseline_ses / "anat"
+        all_exist = (out_baseline_anat / baseline_img.name).exists() and (out_baseline_anat / baseline_label.name).exists()
+        for ses_dir, fu_img, fu_label in sessions[1:]:
+            fu_ses = ses_dir.name
+            out_fu_anat = out_root / sub / fu_ses / "anat"
+            if not (out_fu_anat / fu_img.name).exists() or not (out_fu_anat / fu_label.name).exists():
+                all_exist = False
+                break
+        if all_exist:
+            print(f"  Skipping {sub}: all registered outputs already exist")
+            continue
+
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir = Path(tmpdir)
 
@@ -126,11 +149,10 @@ def main():
             baseline_disc = get_disc_file(baseline_disc_out)
 
             # --- Copy baseline to output as-is ---
-            out_baseline_anat = out_root / sub / baseline_ses / "anat"
             out_baseline_anat.mkdir(parents=True, exist_ok=True)
             shutil.copy2(baseline_img, out_baseline_anat / baseline_img.name)
-            if baseline_label:
-                shutil.copy2(baseline_label, out_baseline_anat / baseline_label.name)
+            # Copy the baseline label
+            shutil.copy2(baseline_label, out_baseline_anat / baseline_label.name)
 
             # --- Process each follow-up ---
             for ses_dir, fu_img, fu_label in sessions[1:]:
@@ -144,6 +166,9 @@ def main():
                 segment_discs(fu_img, fu_disc_out)
                 fu_disc = get_disc_file(fu_disc_out)
 
+                # Both baseline and follow-up disc files need to have the same discs present, so we only keep the common ones.
+                keep_common_levels_only(fu_disc, baseline_disc)
+
                 # Register follow-up to baseline
                 fu_stem = fu_img.stem.replace(".nii", "")
                 reg_output = tmpdir / f"{fu_stem}_reg.nii.gz"
@@ -152,8 +177,7 @@ def main():
                 # Find the warping field produced by sct_register_multimodal
                 warp_field = tmpdir / f"warp_{fu_img.name.replace('.nii.gz', '')}2{baseline_img.name.replace('.nii.gz', '')}.nii.gz"
                 if not warp_field.exists():
-                    # Try alternative naming in current directory
-                    warp_field = Path(f"warp_{fu_img.name.replace('.nii.gz', '')}2{baseline_img.name.replace('.nii.gz', '')}.nii.gz")
+                    raise FileNotFoundError(f"Warping field not found: {warp_field}")
 
                 # Output directory
                 out_fu_anat = out_root / sub / fu_ses / "anat"
@@ -162,11 +186,13 @@ def main():
                 # Copy registered image
                 shutil.copy2(reg_output, out_fu_anat / fu_img.name)
 
-                # Apply warping field to lesion label if it exists
-                if fu_label and warp_field.exists():
-                    reg_label = tmpdir / f"{fu_label.stem.replace('.nii', '')}_reg.nii.gz"
-                    apply_transfo(fu_label, baseline_img, warp_field, reg_label)
-                    shutil.copy2(reg_label, out_fu_anat / fu_label.name)
+                # Apply warping field to lesion label
+                reg_label = tmpdir / f"{fu_label.stem.replace('.nii', '')}_reg.nii.gz"
+                apply_transfo(fu_label, baseline_img, warp_field, reg_label)
+                shutil.copy2(reg_label, out_fu_anat / fu_label.name)
+
+                break
+            break
 
     print("Done.")
 
