@@ -9,6 +9,7 @@ Arguments:
     -pad-rl: Right-Left padding in mm (default: 20)
     -canproco: If we crop the canproco dataset, then we only deal with PSIR and STIR data.
     --exclude-canproco: Path to the yml file containing the list of subjects to exclude from the canproco dataset
+    --bavaria: If we crop the bavaria dataset, then we only crop axial T2w data.
     
 Author: Pierre-Louis Benveniste
 """
@@ -28,7 +29,7 @@ import yaml
 # BIDS helpers
 # ---------------------------------------------------------------------------
 
-def find_cases(bids_root: Path, canproco: bool, exclude_file: Path = None) -> dict:
+def find_cases(bids_root: Path, canproco: bool, exclude_canproco: Path = None, bavaria: bool = False) -> dict:
     """Return {image_path: label_path | None} for every image under sub-*/ses-*/anat/."""
     cases = {}
     list_images = sorted(bids_root.glob("sub-*/ses-*/anat/*.nii.gz"))
@@ -36,7 +37,7 @@ def find_cases(bids_root: Path, canproco: bool, exclude_file: Path = None) -> di
         list_images = [img for img in list_images if "PSIR" in img.name or "STIR" in img.name]
         # We load the exclude file in the canproco dataset
         subjects_to_remove = ["sub-cal123"]
-        with open(exclude_file, 'r') as file:
+        with open(exclude_canproco, 'r') as file:
             exclude_list = yaml.load(file, Loader=yaml.FullLoader)
             exclude_list = exclude_list["PSIR"] + exclude_list["STIR"]
         subjects_to_remove.extend(exclude_list)
@@ -44,15 +45,19 @@ def find_cases(bids_root: Path, canproco: bool, exclude_file: Path = None) -> di
         subjects_to_remove = [sub.split("_")[0] for sub in subjects_to_remove]
         list_images = [img for img in list_images if img.parts[-4] not in subjects_to_remove]
     
+    
     for img in list_images:
         stem  = img.name.replace(".nii.gz", "")
         lbl   = (bids_root / "derivatives" / "labels"
                  / img.relative_to(bids_root).parent
                  / f"{stem}_label-lesion_seg.nii.gz")
-        if canproco:
+        if canproco or bavaria:
             lbl = (bids_root / "derivatives" / "labels"
                    / img.relative_to(bids_root).parent
                    / f"{stem}_lesion-manual.nii.gz")
+        if bavaria and not lbl.exists():
+            # Then we skip this case
+            continue
         if canproco and not lbl.exists():
             # Then in this case, we segment the lesions on the original image
             pred_lesion_seg = (bids_root / "derivatives" / "labels-pred"
@@ -104,6 +109,7 @@ def parse_args():
     p.add_argument("--pad-ap",   type=float, default=20,  help="A-P padding mm        (default: 20)")
     p.add_argument("--canproco", action="store_true", help="If we crop the canproco dataset, then we only deal with PSIR and STIR data.")
     p.add_argument("--exclude-canproco", type=str, default=None, help="Path to the yml file containing the list of subjects to exclude from the canproco dataset")
+    p.add_argument("--bavaria", action="store_true", help="If we crop the bavaria dataset.")
     return p.parse_args()
 
 
@@ -119,7 +125,7 @@ def main():
         pad_ap=args.pad_ap,
     )
 
-    cases = find_cases(src, args.canproco, args.exclude_canproco)
+    cases = find_cases(src, args.canproco, args.exclude_canproco, args.bavaria)
     print(f"Found {len(cases)} images")
 
     with tempfile.TemporaryDirectory(prefix="sc_crop_") as tmp:
