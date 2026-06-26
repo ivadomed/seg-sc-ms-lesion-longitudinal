@@ -51,14 +51,33 @@ def find_subjects(bids_root: Path) -> dict:
     return subjects
 
 
-def segment_sc(image: Path, output: Path):
-    """Segment spinal cord."""
+def segment_sc(image: Path, output: Path, cache: Path = None):
+    """Segment spinal cord. If cache is provided and exists, copy from cache instead."""
+    if cache and cache.exists():
+        print(f"  [cache] Reusing SC seg from {cache}")
+        shutil.copy2(cache, output)
+        return
     run(f"SCT_USE_GPU=1 sct_deepseg spinalcord -i {image} -o {output}")
+    if cache:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(output, cache)
 
 
-def segment_discs(image: Path, output: Path):
+def segment_discs(image: Path, output: Path, cache: Path = None):
     """Detect disc labels. The actual disc file is output with _totalspineseg_discs suffix."""
+    cached_disc = None
+    if cache:
+        cached_disc = cache.parent / get_disc_file(cache).name
+    if cache and cache.exists() and cached_disc.exists():
+        print(f"  [cache] Reusing disc seg from {cache}")
+        shutil.copy2(cache, output)
+        shutil.copy2(cached_disc, get_disc_file(output))
+        return
     run(f"SCT_USE_GPU=1 sct_deepseg spine -i {image} -o {output}")
+    if cache:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(output, cache)
+        shutil.copy2(get_disc_file(output), cached_disc)
 
 
 def get_disc_file(output: Path) -> Path:
@@ -107,6 +126,9 @@ def main():
     parser = argparse.ArgumentParser(description="Affine-register a BIDS dataset to baseline sessions.")
     parser.add_argument("-i", required=True, help="Path to source BIDS dataset")
     parser.add_argument("-o", required=True, help="Path to output registered dataset")
+    parser.add_argument("-p", "--predictions", default=None,
+                        help="Path to cache SC/disc predictions. If provided, predictions are "
+                             "saved there and reused on subsequent runs.")
     args = parser.parse_args()
 
     bids_root = Path(args.i)
@@ -137,15 +159,21 @@ def main():
             print(f"  Skipping {sub}: all registered outputs already exist")
             continue
 
+        # Cache directory for SC/disc predictions
+        pred_dir = Path(args.predictions) / sub if args.predictions else None
+
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir = Path(tmpdir)
 
             # --- Segment baseline ---
-            baseline_sc_seg = tmpdir / f"{baseline_img.stem.replace('.nii', '')}_sc-seg.nii.gz"
-            segment_sc(baseline_img, baseline_sc_seg)
+            baseline_stem = baseline_img.stem.replace('.nii', '')
+            baseline_sc_seg = tmpdir / f"{baseline_stem}_sc-seg.nii.gz"
+            cache_sc = pred_dir / baseline_ses / f"{baseline_stem}_sc-seg.nii.gz" if pred_dir else None
+            segment_sc(baseline_img, baseline_sc_seg, cache=cache_sc)
 
-            baseline_disc_out = tmpdir / f"{baseline_img.stem.replace('.nii', '')}_disc-labels.nii.gz"
-            segment_discs(baseline_img, baseline_disc_out)
+            baseline_disc_out = tmpdir / f"{baseline_stem}_disc-labels.nii.gz"
+            cache_disc = pred_dir / baseline_ses / f"{baseline_stem}_disc-labels.nii.gz" if pred_dir else None
+            segment_discs(baseline_img, baseline_disc_out, cache=cache_disc)
             baseline_disc = get_disc_file(baseline_disc_out)
 
             # --- Copy baseline to output as-is ---
@@ -159,18 +187,20 @@ def main():
                 fu_ses = ses_dir.name
 
                 # Segment follow-up
-                fu_sc_seg = tmpdir / f"{fu_img.stem.replace('.nii', '')}_sc-seg.nii.gz"
-                segment_sc(fu_img, fu_sc_seg)
+                fu_stem = fu_img.stem.replace('.nii', '')
+                fu_sc_seg = tmpdir / f"{fu_stem}_sc-seg.nii.gz"
+                cache_fu_sc = pred_dir / fu_ses / f"{fu_stem}_sc-seg.nii.gz" if pred_dir else None
+                segment_sc(fu_img, fu_sc_seg, cache=cache_fu_sc)
 
-                fu_disc_out = tmpdir / f"{fu_img.stem.replace('.nii', '')}_disc-labels.nii.gz"
-                segment_discs(fu_img, fu_disc_out)
+                fu_disc_out = tmpdir / f"{fu_stem}_disc-labels.nii.gz"
+                cache_fu_disc = pred_dir / fu_ses / f"{fu_stem}_disc-labels.nii.gz" if pred_dir else None
+                segment_discs(fu_img, fu_disc_out, cache=cache_fu_disc)
                 fu_disc = get_disc_file(fu_disc_out)
 
                 # Both baseline and follow-up disc files need to have the same discs present, so we only keep the common ones.
                 keep_common_levels_only(fu_disc, baseline_disc)
 
                 # Register follow-up to baseline
-                fu_stem = fu_img.stem.replace(".nii", "")
                 reg_output = tmpdir / f"{fu_stem}_reg.nii.gz"
                 register(fu_img, baseline_img, fu_sc_seg, baseline_sc_seg, fu_disc, baseline_disc, reg_output)
 
