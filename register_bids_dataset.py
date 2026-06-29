@@ -1,8 +1,13 @@
 """
-Takes a BIDS dataset and produces an affine-registered version where all
-follow-up sessions are registered to each subject's baseline session.
+Takes a BIDS dataset and produces an affine-registered version where follow-up
+sessions are registered to the baseline session.
 
-Steps per subject:
+Registration is done WITHIN groups of same subject, same contrast and same chunk
+(mirroring the pairing used to build the MSD dataset in mambax-net/create_msd.py),
+so a follow-up is only ever registered onto a baseline that shares its contrast
+and chunk. The first (earliest) session of each group is the baseline.
+
+Steps per group:
   1. Segment spinal cord (sct_deepseg spinalcord)
   2. Detect disc labels (sct_deepseg spine)
   3. Register each follow-up to baseline (sct_register_multimodal)
@@ -30,9 +35,33 @@ def run(cmd: str):
     subprocess.run(cmd, shell=True, check=True)
 
 
-def find_subjects(bids_root: Path) -> dict:
-    """Return {subject_id: sorted list of (session_dir, image_path, label_path|None)}."""
-    subjects = {}
+def get_contrast(image_path: Path) -> str:
+    """Extracts the contrast identifier from the filename (last underscore-separated token before .nii.gz)."""
+    return image_path.name.replace(".nii.gz", "").split("_")[-1]
+
+
+def get_chunk(image_path: Path) -> str:
+    """
+    Extracts the chunk identifier (e.g. 'chunk-2') from a BIDS filename, or '' if
+    none is present. Used to keep different chunks of the same subject/contrast
+    from being registered together (matches mambax-net/create_msd.py).
+    """
+    for token in image_path.name.split("_"):
+        if token.startswith("chunk-"):
+            return token
+    return ""
+
+
+def find_groups(bids_root: Path) -> dict:
+    """
+    Return {(subject, contrast, chunk): sorted list of (session_dir, image_path, label_path)}.
+
+    Images are grouped by subject, contrast and chunk so that a follow-up is only
+    ever paired with a baseline that shares its contrast and chunk (same grouping
+    as mambax-net/create_msd.py). Sessions within a group are sorted chronologically
+    by session folder name (ses-YYYYMMDD), so the first entry is the baseline.
+    """
+    groups = {}
     for img in sorted(bids_root.glob("sub-*/ses-*/anat/*.nii.gz")):
         if "derivatives" in img.parts:
             continue
@@ -45,10 +74,11 @@ def find_subjects(bids_root: Path) -> dict:
         if not label.exists():
             # This is image has no label, we don't include the image in the list of cases
             continue
-        subjects.setdefault(sub, []).append((img.parent, img, label))
-    for sub in subjects:
-        subjects[sub].sort(key=lambda x: x[0].name)
-    return subjects
+        key = (sub, get_contrast(img), get_chunk(img))
+        groups.setdefault(key, []).append((img.parent, img, label))
+    for key in groups:
+        groups[key].sort(key=lambda x: x[0].name)
+    return groups
 
 
 def segment_sc(image: Path, output: Path, cache: Path = None):
@@ -135,12 +165,13 @@ def main():
     out_root = Path(args.o)
     out_root.mkdir(parents=True, exist_ok=True)
 
-    subjects = find_subjects(bids_root)
-    print(f"Found {len(subjects)} subjects")
+    groups = find_groups(bids_root)
+    print(f"Found {len(groups)} (subject, contrast, chunk) groups")
 
-    for sub, sessions in tqdm.tqdm(subjects.items(), desc="Subjects"):
+    for (sub, contrast, chunk), sessions in tqdm.tqdm(groups.items(), desc="Groups"):
+        group_label = f"{sub} [{contrast}{(' ' + chunk) if chunk else ''}]"
         if len(sessions) < 2:
-            print(f"  Skipping {sub}: only {len(sessions)} session(s)")
+            print(f"  Skipping {group_label}: only {len(sessions)} session(s)")
             continue
 
         baseline_dir, baseline_img, baseline_label = sessions[0]
@@ -156,7 +187,7 @@ def main():
                 all_exist = False
                 break
         if all_exist:
-            print(f"  Skipping {sub}: all registered outputs already exist")
+            print(f"  Skipping {group_label}: all registered outputs already exist")
             continue
 
         # Cache directory for SC/disc predictions
@@ -220,9 +251,6 @@ def main():
                 reg_label = tmpdir / f"{fu_label.stem.replace('.nii', '')}_reg.nii.gz"
                 apply_transfo(fu_label, baseline_img, warp_field, reg_label)
                 shutil.copy2(reg_label, out_fu_anat / fu_label.name)
-
-                break
-            break
 
     print("Done.")
 
