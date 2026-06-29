@@ -62,15 +62,32 @@ def get_subject(derivative_path: Path) -> str:
     return derivative_path.name.split('_')[0]
 
 
+def get_chunk(derivative_path: Path) -> str:
+    """
+    Extracts the chunk identifier (e.g. 'chunk-2') from a BIDS filename, or '' if
+    none is present. Used to keep different chunks of the same subject/contrast
+    (e.g. bavaria 'sub-m776721_ses-20210208_acq-ax_chunk-2_T2w.nii.gz') from being
+    paired together.
+    """
+    for token in derivative_path.name.split('_'):
+        if token.startswith('chunk-'):
+            return token
+    return ''
+
+
 def build_longitudinal_pairs(derivatives: list, site: str) -> list:
     """
-    Groups derivatives by (subject, contrast), sorts sessions chronologically,
-    and builds consecutive pairs (session N, session N+1).
+    Groups derivatives by (subject, contrast, chunk), sorts sessions
+    chronologically, and builds consecutive pairs (session N, session N+1).
+
+    Grouping on contrast guarantees both images of a pair share the same
+    contrast; grouping on chunk keeps different chunks of the same
+    subject/contrast (e.g. bavaria acq-ax chunk-1 vs chunk-2) from being paired.
 
     Each pair is a dict with:
         image1, label1  -> earlier timepoint
         image2, label2  -> later timepoint
-        subject, contrast, session1, session2, site
+        subject, contrast, chunk, session1, session2, site
 
     Only pairs where all four files exist on disk are included.
 
@@ -81,16 +98,18 @@ def build_longitudinal_pairs(derivatives: list, site: str) -> list:
     Returns:
         pairs : list[dict]
     """
-    # Group by (subject, contrast)
+    # Group by (subject, contrast, chunk)
     groups = defaultdict(list)
     for deriv in derivatives:
         subject  = get_subject(deriv)
         contrast = get_contrast(deriv)
+        chunk    = get_chunk(deriv)
         session  = get_session_date(deriv)
-        groups[(subject, contrast)].append((session, deriv))
+        groups[(subject, contrast, chunk)].append((session, deriv))
 
     pairs = []
-    for (subject, contrast), entries in groups.items():
+    # We iterate over groups of same subject/contrast/chunk, sort by session date, and build consecutive pairs
+    for (subject, contrast, chunk), entries in groups.items():
         # Sort by session date (lexicographic sort works for YYYYMMDD)
         entries_sorted = sorted(entries, key=lambda x: x[0])
 
@@ -108,7 +127,7 @@ def build_longitudinal_pairs(derivatives: list, site: str) -> list:
             # Only keep pairs where all four files exist
             if not all(os.path.exists(p) for p in [str(label1_path), str(label2_path), image1_path, image2_path]):
                 missing = [p for p in [str(label1_path), str(label2_path), image1_path, image2_path] if not os.path.exists(p)]
-                logger.warning(f"Skipping pair ({site}, {subject}, {contrast}, {ses1}->{ses2}): missing files: {missing}")
+                logger.warning(f"Skipping pair ({site}, {subject}, {contrast}, {chunk}, {ses1}->{ses2}): missing files: {missing}")
                 continue
 
             pairs.append({
@@ -118,6 +137,7 @@ def build_longitudinal_pairs(derivatives: list, site: str) -> list:
                 "label2":    str(label2_path),
                 "subject":   subject,
                 "contrast":  contrast,
+                "chunk":     chunk,
                 "session1":  ses1,
                 "session2":  ses2,
                 "site":      site,
