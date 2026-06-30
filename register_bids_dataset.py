@@ -172,8 +172,8 @@ def main():
     out_root.mkdir(parents=True, exist_ok=True)
 
     # QC folder for the registration, inside the output registered dataset
-    qc_dir = os.path.join(out_root, "QC")
-    os.makedirs(qc_dir, exist_ok=True)
+    qc_dir = Path(os.path.join(out_root, "QC"))
+    qc_dir.mkdir(parents=True, exist_ok=True)
 
     groups = find_groups(bids_root)
     print(f"Found {len(groups)} (subject, contrast, chunk) groups")
