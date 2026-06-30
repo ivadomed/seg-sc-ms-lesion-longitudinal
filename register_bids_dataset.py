@@ -27,6 +27,7 @@ import tempfile
 from pathlib import Path
 
 import tqdm
+import os
 
 
 def run(cmd: str):
@@ -128,7 +129,7 @@ def keep_common_levels_only(levels_1, levels_2, out_1, out_2):
     return out_1, out_2
 
 
-def register(moving_img, fixed_img, moving_seg, fixed_seg, moving_disc, fixed_disc, output):
+def register(moving_img, fixed_img, moving_seg, fixed_seg, moving_disc, fixed_disc, output, qc_folder):
     """Affine registration of moving to fixed using SC seg and disc labels."""
     run(
         f"sct_register_multimodal"
@@ -141,6 +142,7 @@ def register(moving_img, fixed_img, moving_seg, fixed_seg, moving_disc, fixed_di
         f" -o {output}"
         f" -param step=0,type=label,algo=affine,metric=MeanSquares,slicewise=0,iter=0"
         f":step=1,type=label,algo=affine,metric=MeanSquares,slicewise=0"
+        f" -qc {qc_folder}"
     )
 
 
@@ -168,6 +170,10 @@ def main():
     bids_root = Path(args.i)
     out_root = Path(args.o)
     out_root.mkdir(parents=True, exist_ok=True)
+
+    # QC folder for the registration, inside the output registered dataset
+    qc_dir = os.path.join(out_root, "QC")
+    os.makedirs(qc_dir, exist_ok=True)
 
     groups = find_groups(bids_root)
     print(f"Found {len(groups)} (subject, contrast, chunk) groups")
@@ -246,7 +252,7 @@ def main():
 
                 # Register follow-up to baseline
                 reg_output = tmpdir / f"{fu_stem}_reg.nii.gz"
-                register(fu_img, baseline_img, fu_sc_seg, baseline_sc_seg, fu_disc_common, baseline_disc_common, reg_output)
+                register(fu_img, baseline_img, fu_sc_seg, baseline_sc_seg, fu_disc_common, baseline_disc_common, reg_output, qc_dir)
 
                 # Find the warping field produced by sct_register_multimodal
                 warp_field = tmpdir / f"warp_{fu_img.name.replace('.nii.gz', '')}2{baseline_img.name.replace('.nii.gz', '')}.nii.gz"
