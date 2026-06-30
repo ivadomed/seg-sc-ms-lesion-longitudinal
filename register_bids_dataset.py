@@ -83,40 +83,21 @@ def find_groups(bids_root: Path) -> dict:
     return groups
 
 
-def segment_sc(image: Path, output: Path, cache: Path = None):
-    """Segment spinal cord. If cache is provided and exists, copy from cache instead."""
-    if cache and cache.exists():
-        print(f"  [cache] Reusing SC seg from {cache}")
-        shutil.copy2(cache, output)
-        return
+def segment_sc(image: Path, output: Path):
+    """Segment spinal cord"""
     run(f"SCT_USE_GPU=1 sct_deepseg spinalcord -i {image} -o {output}")
-    if cache:
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(output, cache)
 
 
-def segment_discs(image: Path, output: Path, cache: Path = None):
+def segment_discs(image: Path, tmp_output: Path, output: Path):
     """
-    Detect disc labels. sct_deepseg spine does not produce a file at the -o path
-    itself; the disc labels are written to the _totalspineseg_discs variant, so we
-    only ever cache/reuse that file (the one the caller reads via get_disc_file).
+    Detect disc labels.
+    Multiple files are produced by sct_deepseg spine, but we only keep 
+the _totalspineseg_discs.nii.gz file and move it to the output path.
     """
-    disc_out = get_disc_file(output)
-    cached_disc = (cache.parent / get_disc_file(cache).name) if cache else None
-    if cached_disc and cached_disc.exists():
-        print(f"  [cache] Reusing disc seg from {cached_disc}")
-        shutil.copy2(cached_disc, disc_out)
-        return
-    run(f"SCT_USE_GPU=1 sct_deepseg spine -i {image} -o {output}")
-    if cached_disc:
-        cached_disc.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(disc_out, cached_disc)
-
-
-def get_disc_file(output: Path) -> Path:
-    """Return the _totalspineseg_discs.nii.gz file produced by sct_deepseg spine."""
-    stem = output.name.replace(".nii.gz", "")
-    return output.parent / f"{stem}_totalspineseg_discs.nii.gz"
+    run(f"SCT_USE_GPU=1 sct_deepseg spine -i {image} -o {tmp_output}")
+    # Now we move the _totalspineseg_discs.nii.gz file to the output path
+    disc_file = tmp_output.parent / f"{tmp_output.stem.replace('.nii','')}_totalspineseg_discs.nii.gz"
+    shutil.move(disc_file, output)
 
 
 def keep_common_levels_only(levels_1, levels_2, out_1, out_2):
@@ -139,8 +120,7 @@ def register(moving_img, fixed_img, moving_seg, fixed_seg, moving_disc, fixed_di
         f" -ilabel {moving_disc}"
         f" -dlabel {fixed_disc}"
         f" -o {output}"
-        f" -param step=0,type=label,algo=affine,metric=MeanSquares,slicewise=0,iter=0"
-        f":step=1,type=label,algo=affine,metric=MeanSquares,slicewise=0"
+        f" -param step=0,type=label,algo=affine,metric=MeanSquares,slicewise=0,iter=0:step=1,type=seg,algo=affine,metric=MeanSquares,slicewise=0"
         f" -qc {qc_folder}"
     )
 
@@ -161,9 +141,7 @@ def main():
     parser = argparse.ArgumentParser(description="Affine-register a BIDS dataset to baseline sessions.")
     parser.add_argument("-i", required=True, help="Path to source BIDS dataset")
     parser.add_argument("-o", required=True, help="Path to output registered dataset")
-    parser.add_argument("-p", "--predictions", default=None,
-                        help="Path to cache SC/disc predictions. If provided, predictions are "
-                             "saved there and reused on subsequent runs.")
+    parser.add_argument("-p", required=True, help="Path to cache SC/disc predictions. Predictions are saved there and reused on subsequent runs.")
     args = parser.parse_args()
 
     bids_root = Path(args.i)
@@ -201,22 +179,22 @@ def main():
             print(f"  Skipping {group_label}: all registered outputs already exist")
             continue
 
-        # Cache directory for SC/disc predictions
-        pred_dir = Path(args.predictions) / sub if args.predictions else None
+        # Pred directory for SC/disc predictions
+        pred_dir = Path(args.p) / sub
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir = Path(tmpdir)
 
             # --- Segment baseline ---
             baseline_stem = baseline_img.stem.replace('.nii', '')
-            baseline_sc_seg = tmpdir / f"{baseline_stem}_sc-seg.nii.gz"
-            cache_sc = pred_dir / baseline_ses / f"{baseline_stem}_sc-seg.nii.gz" if pred_dir else None
-            segment_sc(baseline_img, baseline_sc_seg, cache=cache_sc)
+            baseline_sc_seg = pred_dir / baseline_ses / f"{baseline_stem}_sc-seg.nii.gz"
+            if not baseline_sc_seg.exists():
+                segment_sc(baseline_img, baseline_sc_seg)
 
-            baseline_disc_out = tmpdir / f"{baseline_stem}_disc-labels.nii.gz"
-            cache_disc = pred_dir / baseline_ses / f"{baseline_stem}_disc-labels.nii.gz" if pred_dir else None
-            segment_discs(baseline_img, baseline_disc_out, cache=cache_disc)
-            baseline_disc = get_disc_file(baseline_disc_out)
+            baseline_temp_disc = tmpdir / f"{baseline_stem}_disc-labels.nii.gz"
+            baseline_disc = pred_dir / baseline_ses / f"{baseline_stem}_disc-labels.nii.gz"
+            if not baseline_disc.exists():
+                segment_discs(baseline_img, baseline_temp_disc, baseline_disc)
 
             # --- Copy baseline to output as-is ---
             out_baseline_anat.mkdir(parents=True, exist_ok=True)
@@ -234,29 +212,20 @@ def main():
 
                 # Segment follow-up
                 fu_stem = fu_img.stem.replace('.nii', '')
-                fu_sc_seg = tmpdir / f"{fu_stem}_sc-seg.nii.gz"
-                cache_fu_sc = pred_dir / fu_ses / f"{fu_stem}_sc-seg.nii.gz" if pred_dir else None
-                segment_sc(fu_img, fu_sc_seg, cache=cache_fu_sc)
+                fu_sc_seg = pred_dir / fu_ses / f"{fu_stem}_sc-seg.nii.gz"
+                if not fu_sc_seg.exists():
+                    segment_sc(fu_img, fu_sc_seg)
 
-                fu_disc_out = tmpdir / f"{fu_stem}_disc-labels.nii.gz"
-                cache_fu_disc = pred_dir / fu_ses / f"{fu_stem}_disc-labels.nii.gz" if pred_dir else None
-                segment_discs(fu_img, fu_disc_out, cache=cache_fu_disc)
-                fu_disc = get_disc_file(fu_disc_out)
+                fu_temp_disc = tmpdir / f"{fu_stem}_disc-labels.nii.gz"
+                fu_disc = pred_dir / fu_ses / f"{fu_stem}_disc-labels.nii.gz"
+                if not fu_disc.exists():
+                    segment_discs(fu_img, fu_temp_disc, fu_disc)
 
                 # Both baseline and follow-up disc files need to have the same discs present, so we only keep the common ones.
                 # Write to new files so the original disc segmentations (including the shared baseline) are not overwritten.
-                fu_disc_common = tmpdir / f"{fu_stem}_disc-labels_common.nii.gz"
-                baseline_disc_common = tmpdir / f"{baseline_stem}_disc-labels_common_{fu_ses}.nii.gz"
+                fu_disc_common = pred_dir / fu_ses / f"{fu_stem}_disc-labels_common.nii.gz"
+                baseline_disc_common = pred_dir / baseline_ses / f"{baseline_stem}_disc-labels_common_{fu_ses}.nii.gz"
                 keep_common_levels_only(fu_disc, baseline_disc, fu_disc_common, baseline_disc_common)
-
-                # Register follow-up to baseline
-                reg_output = tmpdir / f"{fu_stem}_reg.nii.gz"
-                register(fu_img, baseline_img, fu_sc_seg, baseline_sc_seg, fu_disc_common, baseline_disc_common, reg_output, qc_dir)
-
-                # Find the warping field produced by sct_register_multimodal
-                warp_field = tmpdir / f"warp_{fu_img.name.replace('.nii.gz', '')}2{baseline_img.name.replace('.nii.gz', '')}.nii.gz"
-                if not warp_field.exists():
-                    raise FileNotFoundError(f"Warping field not found: {warp_field}")
 
                 # Output directories
                 out_fu_anat = out_root / sub / fu_ses / "anat"
@@ -264,13 +233,22 @@ def main():
                 out_fu_label = out_root / "derivatives" / "labels" / sub / fu_ses / "anat"
                 out_fu_label.mkdir(parents=True, exist_ok=True)
 
-                # Copy registered image
-                shutil.copy2(reg_output, out_fu_anat / fu_img.name)
+                # Register follow-up to baseline
+                reg_temp_output = tmpdir / f"{fu_stem}_reg.nii.gz"
+                print("adadad")
+                print(reg_temp_output)
+                reg_output = out_root / sub / fu_ses / "anat" / fu_img.name
+                if not reg_output.exists():
+                    register(fu_img, baseline_img, fu_sc_seg, baseline_sc_seg, fu_disc_common, baseline_disc_common, reg_temp_output, qc_dir)
+                    # Copy registered image
+                    shutil.copy2(reg_temp_output, reg_output)
 
-                # Apply warping field to lesion label, save into derivatives/labels
-                reg_label = tmpdir / f"{fu_label.stem.replace('.nii', '')}_reg.nii.gz"
-                apply_transfo(fu_label, baseline_img, warp_field, reg_label)
-                shutil.copy2(reg_label, out_fu_label / fu_label.name)
+                    # Find the warping field produced by sct_register_multimodal
+                    warp_field = tmpdir / f"warp_{fu_img.name.replace('.nii.gz', '')}2{baseline_img.name.replace('.nii.gz', '')}.nii.gz"
+                    # Apply warping field to lesion label, save into derivatives/labels
+                    reg_label = tmpdir / f"{fu_label.stem.replace('.nii', '')}_reg.nii.gz"
+                    apply_transfo(fu_label, baseline_img, warp_field, reg_label)
+                    shutil.copy2(reg_label, out_fu_label / fu_label.name)
 
     print("Done.")
 
