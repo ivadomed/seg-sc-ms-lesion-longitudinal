@@ -66,6 +66,8 @@ def find_groups(bids_root: Path) -> dict:
         if "derivatives" in img.parts:
             continue
         sub = img.parts[-4]
+        # the session folder (ses-YYYYMMDD); img.parent is the anat/ folder
+        session_dir = img.parents[1]
         stem = img.name.replace(".nii.gz", "")
         # the label is the BIDS folder but folder derivatives/labels/ and then the relative path to the image, with the suffix _label-lesion_seg.nii.gz
         label = bids_root / "derivatives" / "labels" / img.relative_to(bids_root).parent / f"{stem}_label-lesion_seg.nii.gz"
@@ -75,7 +77,7 @@ def find_groups(bids_root: Path) -> dict:
             # This is image has no label, we don't include the image in the list of cases
             continue
         key = (sub, get_contrast(img), get_chunk(img))
-        groups.setdefault(key, []).append((img.parent, img, label))
+        groups.setdefault(key, []).append((session_dir, img, label))
     for key in groups:
         groups[key].sort(key=lambda x: x[0].name)
     return groups
@@ -181,11 +183,13 @@ def main():
 
         # --- Check if all output files already exist ---
         out_baseline_anat = out_root / sub / baseline_ses / "anat"
-        all_exist = (out_baseline_anat / baseline_img.name).exists() and (out_baseline_anat / baseline_label.name).exists()
+        out_baseline_label = out_root / "derivatives" / "labels" / sub / baseline_ses / "anat"
+        all_exist = (out_baseline_anat / baseline_img.name).exists() and (out_baseline_label / baseline_label.name).exists()
         for ses_dir, fu_img, fu_label in sessions[1:]:
             fu_ses = ses_dir.name
             out_fu_anat = out_root / sub / fu_ses / "anat"
-            if not (out_fu_anat / fu_img.name).exists() or not (out_fu_anat / fu_label.name).exists():
+            out_fu_label = out_root / "derivatives" / "labels" / sub / fu_ses / "anat"
+            if not (out_fu_anat / fu_img.name).exists() or not (out_fu_label / fu_label.name).exists():
                 all_exist = False
                 break
         if all_exist:
@@ -212,8 +216,9 @@ def main():
             # --- Copy baseline to output as-is ---
             out_baseline_anat.mkdir(parents=True, exist_ok=True)
             shutil.copy2(baseline_img, out_baseline_anat / baseline_img.name)
-            # Copy the baseline label
-            shutil.copy2(baseline_label, out_baseline_anat / baseline_label.name)
+            # Copy the baseline label into derivatives/labels
+            out_baseline_label.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(baseline_label, out_baseline_label / baseline_label.name)
 
             # --- Process each follow-up ---
             for ses_dir, fu_img, fu_label in sessions[1:]:
@@ -248,17 +253,19 @@ def main():
                 if not warp_field.exists():
                     raise FileNotFoundError(f"Warping field not found: {warp_field}")
 
-                # Output directory
+                # Output directories
                 out_fu_anat = out_root / sub / fu_ses / "anat"
                 out_fu_anat.mkdir(parents=True, exist_ok=True)
+                out_fu_label = out_root / "derivatives" / "labels" / sub / fu_ses / "anat"
+                out_fu_label.mkdir(parents=True, exist_ok=True)
 
                 # Copy registered image
                 shutil.copy2(reg_output, out_fu_anat / fu_img.name)
 
-                # Apply warping field to lesion label
+                # Apply warping field to lesion label, save into derivatives/labels
                 reg_label = tmpdir / f"{fu_label.stem.replace('.nii', '')}_reg.nii.gz"
                 apply_transfo(fu_label, baseline_img, warp_field, reg_label)
-                shutil.copy2(reg_label, out_fu_anat / fu_label.name)
+                shutil.copy2(reg_label, out_fu_label / fu_label.name)
 
     print("Done.")
 
