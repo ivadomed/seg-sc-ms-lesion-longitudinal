@@ -94,20 +94,21 @@ def segment_sc(image: Path, output: Path, cache: Path = None):
 
 
 def segment_discs(image: Path, output: Path, cache: Path = None):
-    """Detect disc labels. The actual disc file is output with _totalspineseg_discs suffix."""
-    cached_disc = None
-    if cache:
-        cached_disc = cache.parent / get_disc_file(cache).name
-    if cache and cache.exists() and cached_disc.exists():
-        print(f"  [cache] Reusing disc seg from {cache}")
-        shutil.copy2(cache, output)
-        shutil.copy2(cached_disc, get_disc_file(output))
+    """
+    Detect disc labels. sct_deepseg spine does not produce a file at the -o path
+    itself; the disc labels are written to the _totalspineseg_discs variant, so we
+    only ever cache/reuse that file (the one the caller reads via get_disc_file).
+    """
+    disc_out = get_disc_file(output)
+    cached_disc = (cache.parent / get_disc_file(cache).name) if cache else None
+    if cached_disc and cached_disc.exists():
+        print(f"  [cache] Reusing disc seg from {cached_disc}")
+        shutil.copy2(cached_disc, disc_out)
         return
     run(f"SCT_USE_GPU=1 sct_deepseg spine -i {image} -o {output}")
-    if cache:
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(output, cache)
-        shutil.copy2(get_disc_file(output), cached_disc)
+    if cached_disc:
+        cached_disc.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(disc_out, cached_disc)
 
 
 def get_disc_file(output: Path) -> Path:
@@ -116,12 +117,13 @@ def get_disc_file(output: Path) -> Path:
     return output.parent / f"{stem}_totalspineseg_discs.nii.gz"
 
 
-def keep_common_levels_only(levels_1, levels_2):
+def keep_common_levels_only(levels_1, levels_2, out_1, out_2):
     """
     This function keeps only the common disc levels between two level segmentations.
+    The filtered results are written to new files (out_1, out_2) without overwriting the inputs.
     """
-    run(f"sct_label_utils -i {levels_1} -remove-sym {levels_2} -o {levels_1},{levels_2}")
-    return None
+    run(f"sct_label_utils -i {levels_1} -remove-sym {levels_2} -o {out_1} {out_2}")
+    return out_1, out_2
 
 
 def register(moving_img, fixed_img, moving_seg, fixed_seg, moving_disc, fixed_disc, output):
@@ -215,6 +217,9 @@ def main():
 
             # --- Process each follow-up ---
             for ses_dir, fu_img, fu_label in sessions[1:]:
+                # Logging
+                print("----------------------------------------------------------------")
+                print(f"  Registering {fu_img.name} to baseline {baseline_img.name}")
                 fu_ses = ses_dir.name
 
                 # Segment follow-up
@@ -229,11 +234,14 @@ def main():
                 fu_disc = get_disc_file(fu_disc_out)
 
                 # Both baseline and follow-up disc files need to have the same discs present, so we only keep the common ones.
-                keep_common_levels_only(fu_disc, baseline_disc)
+                # Write to new files so the original disc segmentations (including the shared baseline) are not overwritten.
+                fu_disc_common = tmpdir / f"{fu_stem}_disc-labels_common.nii.gz"
+                baseline_disc_common = tmpdir / f"{baseline_stem}_disc-labels_common_{fu_ses}.nii.gz"
+                keep_common_levels_only(fu_disc, baseline_disc, fu_disc_common, baseline_disc_common)
 
                 # Register follow-up to baseline
                 reg_output = tmpdir / f"{fu_stem}_reg.nii.gz"
-                register(fu_img, baseline_img, fu_sc_seg, baseline_sc_seg, fu_disc, baseline_disc, reg_output)
+                register(fu_img, baseline_img, fu_sc_seg, baseline_sc_seg, fu_disc_common, baseline_disc_common, reg_output)
 
                 # Find the warping field produced by sct_register_multimodal
                 warp_field = tmpdir / f"warp_{fu_img.name.replace('.nii.gz', '')}2{baseline_img.name.replace('.nii.gz', '')}.nii.gz"
