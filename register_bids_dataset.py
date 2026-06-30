@@ -36,11 +36,6 @@ def run(cmd: str):
     subprocess.run(cmd, shell=True, check=True)
 
 
-def get_contrast(image_path: Path) -> str:
-    """Extracts the contrast identifier from the filename (last underscore-separated token before .nii.gz)."""
-    return image_path.name.replace(".nii.gz", "").split("_")[-1]
-
-
 def get_chunk(image_path: Path) -> str:
     """
     Extracts the chunk identifier (e.g. 'chunk-2') from a BIDS filename, or '' if
@@ -63,8 +58,8 @@ def find_groups(bids_root: Path) -> dict:
     by session folder name (ses-YYYYMMDD), so the first entry is the baseline.
     """
     groups = {}
-    for img in sorted(bids_root.glob("sub-*/ses-*/anat/*.nii.gz")):
-        if "derivatives" in img.parts:
+    for img in sorted(bids_root.rglob("*.nii.gz")):
+        if "derivatives" in img.parts or "SHA256" in img.parts:
             continue
         sub = img.parts[-4]
         # the session folder (ses-YYYYMMDD); img.parent is the anat/ folder
@@ -77,7 +72,8 @@ def find_groups(bids_root: Path) -> dict:
         if not label.exists():
             # This is image has no label, we don't include the image in the list of cases
             continue
-        key = (sub, get_contrast(img), get_chunk(img))
+        contrast = stem.split("_")[-1]
+        key = (sub, contrast, get_chunk(img))
         groups.setdefault(key, []).append((session_dir, img, label))
     for key in groups:
         groups[key].sort(key=lambda x: x[0].name)
