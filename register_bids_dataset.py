@@ -69,6 +69,9 @@ def find_groups(bids_root: Path) -> dict:
         label = bids_root / "derivatives" / "labels" / img.relative_to(bids_root).parent / f"{stem}_label-lesion_seg.nii.gz"
         if not label.exists():
             label = bids_root / "derivatives" / "labels" / img.relative_to(bids_root).parent / f"{stem}_lesion-manual.nii.gz"
+        # This is a temporary fix since the canproco segs need to be manually corrected
+        if not label.exists():
+            label = bids_root / "derivatives" / "labels-pred" / img.relative_to(bids_root).parent / f"{stem}_lesion-manual.nii.gz"
         if not label.exists():
             # This is image has no label, we don't include the image in the list of cases
             continue
