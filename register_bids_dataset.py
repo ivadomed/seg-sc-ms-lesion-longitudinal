@@ -120,9 +120,10 @@ def register(moving_img, fixed_img, moving_seg, fixed_seg, moving_disc, fixed_di
         f" -ilabel {moving_disc}"
         f" -dlabel {fixed_disc}"
         f" -o {output}"
-        f" -param step=0,type=label,algo=affine,metric=MeanSquares,slicewise=0,iter=0:step=1,type=seg,algo=affine,metric=MeanSquares,slicewise=0"
+        f" -param step=0,type=label,dof=Tx_Ty_Tz:step=1,type=seg,algo=centermassrot"
         f" -qc {qc_folder}"
     )
+
 
 
 def apply_transfo(input_file, dest_file, warp_field, output_file):
