@@ -91,13 +91,20 @@ def segment_sc(image: Path, output: Path):
 def segment_discs(image: Path, tmp_output: Path, output: Path):
     """
     Detect disc labels.
-    Multiple files are produced by sct_deepseg spine, but we only keep 
-the _totalspineseg_discs.nii.gz file and move it to the output path.
+    Multiple files are produced by sct_deepseg spine, but we only keep
+    the _totalspineseg_discs.nii.gz file and move it to the output path.
     """
     run(f"SCT_USE_GPU=1 sct_deepseg spine -i {image} -o {tmp_output}")
     # Now we move the _totalspineseg_discs.nii.gz file to the output path
     disc_file = tmp_output.parent / f"{tmp_output.stem.replace('.nii','')}_totalspineseg_discs.nii.gz"
     shutil.move(disc_file, output)
+
+
+def log_disc_seg_failure(image: Path, out_root: Path):
+    """Append the path of an image whose disc segmentation failed to a tracking file."""
+    failures_file = out_root / "disc_seg_failures.txt"
+    with open(failures_file, "a") as f:
+        f.write(f"{image}\n")
 
 
 def keep_common_levels_only(levels_1, levels_2, out_1, out_2):
@@ -195,7 +202,12 @@ def main():
             baseline_temp_disc = tmpdir / f"{baseline_stem}_disc-labels.nii.gz"
             baseline_disc = pred_dir / baseline_ses / f"{baseline_stem}_disc-labels.nii.gz"
             if not baseline_disc.exists():
-                segment_discs(baseline_img, baseline_temp_disc, baseline_disc)
+                try:
+                    segment_discs(baseline_img, baseline_temp_disc, baseline_disc)
+                except subprocess.CalledProcessError:
+                    print(f"  Skipping {group_label}: baseline disc segmentation failed for {baseline_img.name}")
+                    log_disc_seg_failure(baseline_img, out_root)
+                    continue
 
             # --- Copy baseline to output as-is ---
             out_baseline_anat.mkdir(parents=True, exist_ok=True)
@@ -220,7 +232,12 @@ def main():
                 fu_temp_disc = tmpdir / f"{fu_stem}_disc-labels.nii.gz"
                 fu_disc = pred_dir / fu_ses / f"{fu_stem}_disc-labels.nii.gz"
                 if not fu_disc.exists():
-                    segment_discs(fu_img, fu_temp_disc, fu_disc)
+                    try:
+                        segment_discs(fu_img, fu_temp_disc, fu_disc)
+                    except subprocess.CalledProcessError:
+                        print(f"  Skipping follow-up {fu_img.name} in {group_label}: disc segmentation failed")
+                        log_disc_seg_failure(fu_img, out_root)
+                        continue
 
                 # Both baseline and follow-up disc files need to have the same discs present, so we only keep the common ones.
                 # Write to new files so the original disc segmentations (including the shared baseline) are not overwritten.
