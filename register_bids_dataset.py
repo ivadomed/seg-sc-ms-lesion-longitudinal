@@ -26,6 +26,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+import nibabel as nib
+import numpy as np
 import tqdm
 import os
 
@@ -123,6 +125,18 @@ def keep_common_levels_only(levels_1, levels_2, out_1, out_2):
     """
     run(f"sct_label_utils -i {levels_1} -remove-sym {levels_2} -o {out_1} {out_2}")
     return out_1, out_2
+
+
+def is_label_empty(label_path: Path) -> bool:
+    """Return True if a label image contains no nonzero voxels."""
+    return not np.any(nib.load(label_path).get_fdata())
+
+
+def log_registration_failure(image: Path, out_root: Path, reason: str):
+    """Append the path of an image whose registration failed to a tracking file, with the reason."""
+    failures_file = out_root / "registration_failures.txt"
+    with open(failures_file, "a") as f:
+        f.write(f"{image}\t{reason}\n")
 
 
 def register(moving_img, fixed_img, moving_seg, fixed_seg, moving_disc, fixed_disc, output, qc_folder):
@@ -264,6 +278,12 @@ def main():
                 baseline_disc_common = pred_dir / baseline_ses / f"{baseline_stem}_disc-labels_common_{fu_ses}.nii.gz"
                 keep_common_levels_only(fu_disc, baseline_disc, fu_disc_common, baseline_disc_common)
 
+                # If the two sessions share no disc levels, registration has nothing to align on
+                if is_label_empty(fu_disc_common) or is_label_empty(baseline_disc_common):
+                    print(f"  Skipping follow-up {fu_img.name} in {group_label}: no common disc levels with baseline")
+                    log_registration_failure(fu_img, out_root, "no common disc levels")
+                    continue
+
                 # Output directories
                 out_fu_anat = out_root / sub / fu_ses / "anat"
                 out_fu_anat.mkdir(parents=True, exist_ok=True)
@@ -272,11 +292,14 @@ def main():
 
                 # Register follow-up to baseline
                 reg_temp_output = tmpdir / f"{fu_stem}_reg.nii.gz"
-                print("adadad")
-                print(reg_temp_output)
                 reg_output = out_root / sub / fu_ses / "anat" / fu_img.name
                 if not reg_output.exists():
-                    register(fu_img, baseline_img, fu_sc_seg, baseline_sc_seg, fu_disc_common, baseline_disc_common, reg_temp_output, qc_dir)
+                    try:
+                        register(fu_img, baseline_img, fu_sc_seg, baseline_sc_seg, fu_disc_common, baseline_disc_common, reg_temp_output, qc_dir)
+                    except subprocess.CalledProcessError:
+                        print(f"  Skipping follow-up {fu_img.name} in {group_label}: registration failed")
+                        log_registration_failure(fu_img, out_root, "registration failed")
+                        continue
                     # Copy registered image
                     shutil.copy2(reg_temp_output, reg_output)
 
@@ -284,7 +307,12 @@ def main():
                     warp_field = tmpdir / f"warp_{fu_img.name.replace('.nii.gz', '')}2{baseline_img.name.replace('.nii.gz', '')}.nii.gz"
                     # Apply warping field to lesion label, save into derivatives/labels
                     reg_label = tmpdir / f"{fu_label.stem.replace('.nii', '')}_reg.nii.gz"
-                    apply_transfo(fu_label, baseline_img, warp_field, reg_label)
+                    try:
+                        apply_transfo(fu_label, baseline_img, warp_field, reg_label)
+                    except subprocess.CalledProcessError:
+                        print(f"  Skipping follow-up {fu_img.name} in {group_label}: applying warp field failed")
+                        log_registration_failure(fu_img, out_root, "apply_transfo failed")
+                        continue
                     shutil.copy2(reg_label, out_fu_label / fu_label.name)
 
     print("Done.")
