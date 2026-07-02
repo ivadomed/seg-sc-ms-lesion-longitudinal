@@ -1,0 +1,232 @@
+"""
+Longitudinal attention segmentation model.
+
+The follow-up scan is the primary input; the baseline scan is treated as a
+contextual prompt (in the spirit of the modality-prompt / modular-fusion
+design in doc/Modular-Cross-Attention-Fusion) and is fused into the
+follow-up encoder features via cross-attention at every resolution level.
+By default a single pretrained nnU-Net ResidualEncoderUNet encoder is
+shared (weight-tied) between the two time points, the same pattern used
+for the image encoder in the mambax-net-sc-lesion model. Set
+`share_encoder=False` to give each time point its own encoder instead
+(see LongitudinalAttentionUNet).
+
+Two inputs:
+    image_followup – (B, 1, *spatial)  current / follow-up scan  (primary)
+    image_baseline  – (B, 1, *spatial)  prior / baseline scan     (contextual prompt)
+
+One output:
+    logits          – (B, n_classes, *spatial)  lesion segmentation at follow-up
+
+Author: Pierre-Louis Benveniste
+"""
+
+import copy
+import json
+import os
+import pydoc
+from typing import Optional
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from dynamic_network_architectures.architectures.unet import ResidualEncoderUNet
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Weight loading
+# ──────────────────────────────────────────────────────────────────────────────
+
+def load_nnunet_weights(model_folder: str, fold: int = 0, checkpoint_name: str = "checkpoint_best.pth"):
+    """Load a pretrained nnU-Net ResidualEncoderUNet from a fold checkpoint.
+
+    Returns the model together with the `features_per_stage` list from the
+    plans, so callers can size the fusion modules to match.
+    """
+    checkpoint_path = os.path.join(model_folder, f"fold_{fold}", checkpoint_name)
+    plans_path = os.path.join(model_folder, "plans.json")
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    state_dict = checkpoint.get("network_weights", checkpoint.get("state_dict", checkpoint))
+
+    with open(plans_path) as f:
+        plans = json.load(f)
+    arch_kwargs = dict(plans["configurations"]["3d_fullres"]["architecture"]["arch_kwargs"])
+
+    init_args = dict(arch_kwargs)
+    for key in ("conv_op", "norm_op", "nonlin"):
+        if isinstance(init_args.get(key), str):
+            init_args[key] = pydoc.locate(init_args[key])
+
+    model = ResidualEncoderUNet(input_channels=1, num_classes=2, **init_args)
+    model.load_state_dict(state_dict)
+
+    return model, arch_kwargs["features_per_stage"]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Cross-attention fusion (follow-up queries, baseline is the contextual prompt)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class PatchEmbed3D(nn.Module):
+    """Conv3d patch embedding: (B, C, D, H, W) -> (B, N, E) token sequence."""
+
+    def __init__(self, in_channels: int, embed_dim: int, patch_size: int = 2):
+        super().__init__()
+        self.patch_size = patch_size
+        self.proj = nn.Conv3d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x: torch.Tensor):
+        d, h, w = x.shape[2:]
+        p = self.patch_size
+        pad_d, pad_h, pad_w = (-d) % p, (-h) % p, (-w) % p
+        if pad_d or pad_h or pad_w:
+            x = F.pad(x, (0, pad_w, 0, pad_h, 0, pad_d))
+
+        x = self.proj(x)                                    # (B, E, D', H', W')
+        patch_shape = x.shape[2:]
+        tokens = self.norm(x.flatten(2).transpose(1, 2))     # (B, N, E)
+        return tokens, patch_shape
+
+
+class PatchUnembed3D(nn.Module):
+    """Inverse of PatchEmbed3D: (B, N, E) -> (B, C, D, H, W), resized to target."""
+
+    def __init__(self, embed_dim: int, out_channels: int):
+        super().__init__()
+        self.proj = nn.Linear(embed_dim, out_channels)
+
+    def forward(self, tokens: torch.Tensor, patch_shape, target_shape):
+        b = tokens.shape[0]
+        x = self.proj(tokens).transpose(1, 2).reshape(b, -1, *patch_shape)  # (B, C, D', H', W')
+        if x.shape[2:] != tuple(target_shape):
+            x = F.interpolate(x, size=target_shape, mode="trilinear", align_corners=False)
+        return x
+
+
+class CrossAttentionFusion(nn.Module):
+    """
+    Fuses follow-up features (query) with baseline features (contextual
+    prompt, key/value) at a single encoder resolution:
+
+        f_fused = ReLU(CrossAttn(Q=followup, K=V=baseline) + followup)
+    """
+
+    def __init__(self, in_channels: int, embed_dim: int = 32, num_heads: int = 4, patch_size: int = 2):
+        super().__init__()
+        self.embed_followup = PatchEmbed3D(in_channels, embed_dim, patch_size)
+        self.embed_baseline = PatchEmbed3D(in_channels, embed_dim, patch_size)
+        # batch_first=True so tokens are fed directly as (B, N, E)
+        self.cross_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+        self.unembed = PatchUnembed3D(embed_dim, in_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, followup_feat: torch.Tensor, baseline_feat: torch.Tensor) -> torch.Tensor:
+        q_tokens, patch_shape = self.embed_followup(followup_feat)
+        kv_tokens, _ = self.embed_baseline(baseline_feat)
+
+        # need_weights=False routes to the fused SDPA kernel instead of
+        # materialising the full N x N attention matrix.
+        attn_tokens, _ = self.cross_attn(query=q_tokens, key=kv_tokens, value=kv_tokens, need_weights=False)
+        attn_spatial = self.unembed(attn_tokens, patch_shape, followup_feat.shape[2:])
+
+        return self.relu(attn_spatial + followup_feat)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Model
+# ──────────────────────────────────────────────────────────────────────────────
+
+class LongitudinalAttentionUNet(nn.Module):
+    """
+    Segments the follow-up scan using the baseline scan as a contextual
+    prompt. Its decoder (from `resenc_model`) is reused as-is. At every
+    encoder resolution (including the bottleneck), baseline features are
+    fused into follow-up features through cross-attention before being
+    passed to the decoder.
+
+    Encoder sharing is controlled by `share_encoder`:
+        True  (default) — a single pretrained encoder is weight-tied and
+                           called on both time points (fewer parameters,
+                           forces both time points into the same feature
+                           space).
+        False            — each time point gets its own encoder. By default
+                           the baseline encoder is a deep copy of the
+                           follow-up encoder (same pretrained initialisation,
+                           independent weights thereafter); pass
+                           `resenc_model_baseline` to seed it from a
+                           different pretrained checkpoint instead.
+    """
+
+    def __init__(
+        self,
+        resenc_model: ResidualEncoderUNet,
+        features_per_stage,
+        n_classes: int = 2,
+        fusion_embed_dim: int = 32,
+        fusion_num_heads: int = 4,
+        fusion_patch_size: int = 2,
+        share_encoder: bool = True,
+        resenc_model_baseline: Optional[ResidualEncoderUNet] = None,
+    ):
+        super().__init__()
+
+        if share_encoder and resenc_model_baseline is not None:
+            raise ValueError("resenc_model_baseline is ignored when share_encoder=True")
+
+        self.share_encoder = share_encoder
+
+        self.encoder_followup = resenc_model.encoder
+        if share_encoder:
+            self.encoder_baseline = self.encoder_followup
+        elif resenc_model_baseline is not None:
+            self.encoder_baseline = resenc_model_baseline.encoder
+        else:
+            self.encoder_baseline = copy.deepcopy(resenc_model.encoder)
+
+        # Decoder is reused unchanged; its skip inputs receive fused features.
+        decoder = resenc_model.decoder
+        self.transpconvs = decoder.transpconvs
+        self.dec_stages = decoder.stages
+        self.seg_layers = decoder.seg_layers
+
+        self.fusion_blocks = nn.ModuleList([
+            CrossAttentionFusion(
+                in_channels=c,
+                embed_dim=fusion_embed_dim,
+                num_heads=fusion_num_heads,
+                patch_size=fusion_patch_size,
+            )
+            for c in features_per_stage
+        ])
+
+    @staticmethod
+    def _encode(x: torch.Tensor, encoder):
+        """Run `encoder`, returning per-stage features finest -> bottleneck."""
+        x = encoder.stem(x)
+        feats = []
+        for stage in encoder.stages:
+            x = stage(x)
+            feats.append(x)
+        return feats
+
+    def forward(self, image_followup: torch.Tensor, image_baseline: torch.Tensor) -> torch.Tensor:
+        """Returns (B, n_classes, *spatial) logits for the lesion mask at follow-up."""
+        followup_feats = self._encode(image_followup, self.encoder_followup)
+        baseline_feats = self._encode(image_baseline, self.encoder_baseline)
+
+        fused = [
+            fusion(f_t, f_prompt)
+            for fusion, f_t, f_prompt in zip(self.fusion_blocks, followup_feats, baseline_feats)
+        ]
+
+        *skips, bottleneck = fused
+        d = bottleneck
+        for i in range(len(self.dec_stages)):
+            d = self.transpconvs[i](d)
+            skip = skips[-(i + 1)]
+            d = self.dec_stages[i](torch.cat([d, skip], dim=1))
+
+        return self.seg_layers[-1](d)
