@@ -107,6 +107,15 @@ def log_disc_seg_failure(image: Path, out_root: Path):
         f.write(f"{image}\n")
 
 
+def load_disc_seg_failures(out_root: Path) -> set:
+    """Load previously logged disc segmentation failures, so they can be skipped on rerun."""
+    failures_file = out_root / "disc_seg_failures.txt"
+    if not failures_file.exists():
+        return set()
+    with open(failures_file) as f:
+        return {line.strip() for line in f if line.strip()}
+
+
 def keep_common_levels_only(levels_1, levels_2, out_1, out_2):
     """
     This function keeps only the common disc levels between two level segmentations.
@@ -160,6 +169,10 @@ def main():
     qc_dir = Path(os.path.join(out_root, "QC"))
     qc_dir.mkdir(parents=True, exist_ok=True)
 
+    known_disc_seg_failures = load_disc_seg_failures(out_root)
+    if known_disc_seg_failures:
+        print(f"Loaded {len(known_disc_seg_failures)} known disc segmentation failure(s), these will be skipped")
+
     groups = find_groups(bids_root)
     print(f"Found {len(groups)} (subject, contrast, chunk) groups")
 
@@ -202,6 +215,9 @@ def main():
             baseline_temp_disc = tmpdir / f"{baseline_stem}_disc-labels.nii.gz"
             baseline_disc = pred_dir / baseline_ses / f"{baseline_stem}_disc-labels.nii.gz"
             if not baseline_disc.exists():
+                if str(baseline_img) in known_disc_seg_failures:
+                    print(f"  Skipping {group_label}: baseline disc segmentation previously failed for {baseline_img.name}")
+                    continue
                 try:
                     segment_discs(baseline_img, baseline_temp_disc, baseline_disc)
                 except subprocess.CalledProcessError:
@@ -232,6 +248,9 @@ def main():
                 fu_temp_disc = tmpdir / f"{fu_stem}_disc-labels.nii.gz"
                 fu_disc = pred_dir / fu_ses / f"{fu_stem}_disc-labels.nii.gz"
                 if not fu_disc.exists():
+                    if str(fu_img) in known_disc_seg_failures:
+                        print(f"  Skipping follow-up {fu_img.name} in {group_label}: disc segmentation previously failed")
+                        continue
                     try:
                         segment_discs(fu_img, fu_temp_disc, fu_disc)
                     except subprocess.CalledProcessError:
