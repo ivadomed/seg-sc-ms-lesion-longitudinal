@@ -11,6 +11,14 @@ for the image encoder in the mambax-net-sc-lesion model. Set
 `share_encoder=False` to give each time point its own encoder instead
 (see LongitudinalAttentionUNet).
 
+Two fusion mechanisms are selectable at inference via `fusion_type`:
+    "cross_attention"  – spatial multi-head cross-attention over patch
+                          tokens (query=follow-up, key/value=baseline).
+    "channel_attention" – channel-wise squeeze-and-excitation-style gating,
+                          matching `AttentionFusion` in
+                          doc/Modular-Cross-Attention-Fusion's
+                          modular_fusion_wrapper.py.
+
 Two inputs:
     image_followup – (B, 1, *spatial)  current / follow-up scan  (primary)
     image_baseline  – (B, 1, *spatial)  prior / baseline scan     (contextual prompt)
@@ -136,6 +144,68 @@ class CrossAttentionFusion(nn.Module):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Channel-attention fusion (follow-up queries, baseline is the contextual prompt)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _group_norm_groups(num_channels: int, max_groups: int = 8) -> int:
+    """Largest divisor of `num_channels` that is <= max_groups (>= 1)."""
+    for g in range(min(max_groups, num_channels), 0, -1):
+        if num_channels % g == 0:
+            return g
+    return 1
+
+
+class ChannelAttentionFusion(nn.Module):
+    """
+    Channel-wise (squeeze-and-excitation style) gating fusion, matching
+    `AttentionFusion` in doc/Modular-Cross-Attention-Fusion's
+    modular_fusion_wrapper.py, renamed here to follow-up/baseline instead
+    of t2/prompt. Global-average-pools concat(followup, baseline) down to
+    one value per channel, uses it to compute a per-channel sigmoid gate,
+    applies that gate to the baseline (prompt) features, then fuses:
+
+        gate  = sigmoid(Conv(ReLU(Conv(AvgPool(concat(followup, baseline))))))
+        fused = ReLU(GroupNorm(Conv(concat(followup, gate * baseline))))
+
+    Unlike CrossAttentionFusion, the gate is a single scalar per channel per
+    sample — identical at every spatial location — so this cannot express
+    spatially-varying attention between the two time points; it is cheaper
+    and has far fewer parameters.
+
+    The reference `AttentionFusion` also accepts `fusion_channels` and
+    `num_heads` constructor arguments, but never uses either in its
+    forward pass — they are omitted here as dead parameters.
+    """
+
+    def __init__(self, in_channels: int):
+        super().__init__()
+        mid = max(in_channels // 4, 1)
+        groups = _group_norm_groups(in_channels)
+
+        self.global_pool = nn.AdaptiveAvgPool3d(1)
+        self.channel_attention = nn.Sequential(
+            nn.Conv3d(in_channels * 2, mid, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(mid, in_channels, 1),
+            nn.Sigmoid(),
+        )
+        self.fusion_conv = nn.Sequential(
+            nn.Conv3d(in_channels * 2, in_channels, 3, padding=1),
+            nn.GroupNorm(groups, in_channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, followup_feat: torch.Tensor, baseline_feat: torch.Tensor) -> torch.Tensor:
+        combined = torch.cat([followup_feat, baseline_feat], dim=1)
+        gate = self.channel_attention(self.global_pool(combined))
+        gated_baseline = baseline_feat * gate
+        return self.fusion_conv(torch.cat([followup_feat, gated_baseline], dim=1))
+
+
+FUSION_TYPES = ("cross_attention", "channel_attention")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Model
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -144,8 +214,15 @@ class LongitudinalAttentionUNet(nn.Module):
     Segments the follow-up scan using the baseline scan as a contextual
     prompt. Its decoder (from `resenc_model`) is reused as-is. At every
     encoder resolution (including the bottleneck), baseline features are
-    fused into follow-up features through cross-attention before being
-    passed to the decoder.
+    fused into follow-up features before being passed to the decoder.
+
+    The fusion mechanism is controlled by `fusion_type` (see FUSION_TYPES):
+        "cross_attention"    (default) — CrossAttentionFusion, spatial
+                              multi-head cross-attention over patch tokens.
+        "channel_attention"  — ChannelAttentionFusion, squeeze-and-excitation
+                              style per-channel gating (matches
+                              `AttentionFusion` in
+                              doc/Modular-Cross-Attention-Fusion).
 
     Encoder sharing is controlled by `share_encoder`:
         True  (default) — a single pretrained encoder is weight-tied and
@@ -165,6 +242,7 @@ class LongitudinalAttentionUNet(nn.Module):
         resenc_model: ResidualEncoderUNet,
         features_per_stage,
         n_classes: int = 2,
+        fusion_type: str = "cross_attention",
         fusion_embed_dim: int = 32,
         fusion_num_heads: int = 4,
         fusion_patch_size: int = 2,
@@ -173,8 +251,12 @@ class LongitudinalAttentionUNet(nn.Module):
     ):
         super().__init__()
 
+        if fusion_type not in FUSION_TYPES:
+            raise ValueError(f"fusion_type must be one of {FUSION_TYPES}, got {fusion_type!r}")
         if share_encoder and resenc_model_baseline is not None:
             raise ValueError("resenc_model_baseline is ignored when share_encoder=True")
+
+        self.fusion_type = fusion_type
 
         self.share_encoder = share_encoder
 
@@ -192,15 +274,20 @@ class LongitudinalAttentionUNet(nn.Module):
         self.dec_stages = decoder.stages
         self.seg_layers = decoder.seg_layers
 
-        self.fusion_blocks = nn.ModuleList([
-            CrossAttentionFusion(
-                in_channels=c,
-                embed_dim=fusion_embed_dim,
-                num_heads=fusion_num_heads,
-                patch_size=fusion_patch_size,
-            )
-            for c in features_per_stage
-        ])
+        if fusion_type == "cross_attention":
+            self.fusion_blocks = nn.ModuleList([
+                CrossAttentionFusion(
+                    in_channels=c,
+                    embed_dim=fusion_embed_dim,
+                    num_heads=fusion_num_heads,
+                    patch_size=fusion_patch_size,
+                )
+                for c in features_per_stage
+            ])
+        else:
+            self.fusion_blocks = nn.ModuleList([
+                ChannelAttentionFusion(in_channels=c) for c in features_per_stage
+            ])
 
     @staticmethod
     def _encode(x: torch.Tensor, encoder):

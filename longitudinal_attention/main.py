@@ -2,9 +2,10 @@
 Smoke test for LongitudinalAttentionUNet on artificially created tensors.
 
 Builds a small, randomly-initialised ResidualEncoderUNet (no pretrained
-weights required) purely to check that the longitudinal wiring — shared
-encoder, cross-attention fusion of the baseline prompt into the follow-up
-features, and decoder — produces the expected output shape.
+weights required) purely to check that the longitudinal wiring — encoder(s),
+fusion of the baseline prompt into the follow-up features, and decoder —
+produces the expected output shape, for every combination of `fusion_type`
+("cross_attention" / "channel_attention") and `share_encoder` (True / False).
 
 To use real pretrained weights instead, replace `build_dummy_resenc_unet(...)`
 with `load_nnunet_weights(model_folder)` from model.py.
@@ -17,7 +18,7 @@ import torch.nn as nn
 
 from dynamic_network_architectures.architectures.unet import ResidualEncoderUNet
 
-from model import LongitudinalAttentionUNet
+from model import FUSION_TYPES, LongitudinalAttentionUNet
 
 
 def build_dummy_resenc_unet(features_per_stage=(16, 32, 64, 128), n_classes: int = 2) -> ResidualEncoderUNet:
@@ -43,8 +44,14 @@ def build_dummy_resenc_unet(features_per_stage=(16, 32, 64, 128), n_classes: int
     )
 
 
-def run_case(share_encoder: bool, device: torch.device, features_per_stage=(16, 32, 64, 128), n_classes: int = 2):
-    label = "shared encoder" if share_encoder else "separate encoders"
+def run_case(
+    fusion_type: str,
+    share_encoder: bool,
+    device: torch.device,
+    features_per_stage=(16, 32, 64, 128),
+    n_classes: int = 2,
+) -> int:
+    label = f"fusion_type={fusion_type}, share_encoder={share_encoder}"
     print(f"\n--- {label} ---")
 
     resenc_model = build_dummy_resenc_unet(features_per_stage, n_classes)
@@ -52,6 +59,7 @@ def run_case(share_encoder: bool, device: torch.device, features_per_stage=(16, 
         resenc_model=resenc_model,
         features_per_stage=features_per_stage,
         n_classes=n_classes,
+        fusion_type=fusion_type,
         share_encoder=share_encoder,
     )
     model.to(device).eval()
@@ -81,14 +89,19 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    n_params_shared = run_case(share_encoder=True, device=device)
-    n_params_separate = run_case(share_encoder=False, device=device)
+    n_params = {}
+    for fusion_type in FUSION_TYPES:
+        for share_encoder in (True, False):
+            n_params[(fusion_type, share_encoder)] = run_case(fusion_type, share_encoder, device)
 
-    assert n_params_separate > n_params_shared, (
-        "Separate-encoder model should have more parameters than the shared-encoder model."
-    )
-    print(f"\nOK: separate-encoder model has more parameters ({n_params_separate:,}) "
-          f"than the shared-encoder model ({n_params_shared:,}), as expected.")
+    for fusion_type in FUSION_TYPES:
+        shared = n_params[(fusion_type, True)]
+        separate = n_params[(fusion_type, False)]
+        assert separate > shared, (
+            f"[{fusion_type}] separate-encoder model should have more parameters than shared-encoder model."
+        )
+        print(f"\nOK [{fusion_type}]: separate encoders ({separate:,} params) "
+              f"> shared encoder ({shared:,} params), as expected.")
 
 
 if __name__ == "__main__":

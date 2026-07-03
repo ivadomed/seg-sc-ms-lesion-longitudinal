@@ -47,8 +47,9 @@ image_followup ──► encoder_followup ──► f_followup[0..L]  (finest �
 image_baseline  ──► encoder_baseline ──► f_baseline[0..L] │
                                                 │          │
                                                 ▼          ▼
-                                    CrossAttentionFusion[0..L]
-                                    (query = f_followup, key/value = f_baseline)
+                                    fusion_blocks[0..L]         (fusion_type selects the class:
+                                    (query/primary = f_followup,  CrossAttentionFusion or
+                                     context/prompt = f_baseline)  ChannelAttentionFusion)
                                                 │
                                                 ▼
                                         f_fused[0..L]
@@ -103,11 +104,20 @@ single-timepoint UNet is *what* gets fed into its skip connections.
 Everything downstream (fusion blocks, decoder) is identical in both modes;
 only which encoder computes `f_baseline` changes.
 
-### 3. Cross-attention fusion: baseline as a contextual prompt
+### 3. Fusion mechanisms: baseline as a contextual prompt
 
 At **every** encoder resolution — from the finest skip connection down to
-the bottleneck — a `CrossAttentionFusion` block injects baseline information
-into the follow-up feature map:
+the bottleneck — a fusion block injects baseline information into the
+follow-up feature map. Two interchangeable fusion mechanisms are
+implemented; which one is used is selected once, model-wide, via the
+`fusion_type` constructor argument (`model.FUSION_TYPES = ("cross_attention",
+"channel_attention")`). One `fusion_blocks[i]` is instantiated per encoder
+stage regardless of which type is chosen (`fusion_blocks`, a `ModuleList`
+sized from `features_per_stage`), each scoped to that stage's channel count.
+
+#### 3a. `fusion_type="cross_attention"` (default) — `CrossAttentionFusion`
+
+Spatial, token-level, multi-head cross-attention:
 
 ```
 f_fused = ReLU( CrossAttention(Q = f_followup, K = V = f_baseline) + f_followup )
@@ -145,9 +155,52 @@ unpack → residual pipeline, so the whole model runs on CPU (needed for the
 before the cross-attention would recover the `MCAM`-equivalent design if
 desired later.
 
-One `CrossAttentionFusion` block is instantiated per encoder stage
-(`fusion_blocks`, a `ModuleList` sized from `features_per_stage`), each
-scoped to that stage's channel count.
+#### 3b. `fusion_type="channel_attention"` — `ChannelAttentionFusion`
+
+Channel-wise, squeeze-and-excitation-style gating — a direct port of
+`AttentionFusion` from
+[`doc/Modular-Cross-Attention-Fusion/nnunetv2/training/network_architecture/modular_fusion_wrapper.py`](../doc/Modular-Cross-Attention-Fusion/nnunetv2/training/network_architecture/modular_fusion_wrapper.py),
+renamed here from `t2/prompt` to `followup/baseline`:
+
+```
+gate   = sigmoid( Conv(ReLU(Conv( AvgPool(concat(f_followup, f_baseline)) ))) )     # (B, C, 1, 1, 1)
+f_fused = ReLU( GroupNorm( Conv( concat(f_followup, gate * f_baseline) ) ) )
+```
+
+1. **Global-average-pool** `concat(f_followup, f_baseline)` over all spatial
+   dimensions down to one vector per channel.
+2. **Two 1×1×1 convolutions + sigmoid** turn that vector into a per-channel
+   gate in `[0, 1]` (a squeeze-and-excitation bottleneck).
+3. The gate multiplies `f_baseline` — channels of the baseline features the
+   network finds relevant (given the current follow-up/baseline pair) are
+   kept, others are suppressed.
+4. `concat(f_followup, gated f_baseline)` is fused back down to
+   `in_channels` by a `3×3×3` `Conv3d` + `GroupNorm` + `ReLU`.
+
+The reference `AttentionFusion` constructor also accepts `fusion_channels`
+and `num_heads` arguments, but never uses either of them in its `forward` —
+`ChannelAttentionFusion` omits both as dead parameters. `GroupNorm`'s group
+count is chosen automatically as the largest divisor of `in_channels` that
+is `<= 8`, so this works for arbitrary channel counts, not just multiples
+of 8 as in the original.
+
+The key difference from `CrossAttentionFusion`: the gate is a **single
+scalar per channel per sample**, identical at every spatial location. It
+cannot express "this voxel should borrow from a *different* voxel in the
+baseline" — only "this channel of the baseline is/isn't useful right now,
+uniformly across the volume". It is correspondingly cheaper and has far
+fewer parameters (no attention matrix, no `E`-dimensional token
+projections).
+
+#### Comparison
+
+| | `cross_attention` | `channel_attention` |
+|---|---|---|
+| Reference | `MCAM` (`plb/mambax-net`), minus the Mamba block | `AttentionFusion` (`doc/Modular-Cross-Attention-Fusion`) |
+| Granularity | per spatial location (token) | per channel, uniform over space |
+| Can align spatially-shifted lesions | yes — query/key/value attention across locations | no — only reweights channels |
+| Relative cost | higher (attention over `N` tokens) | lower (global pooling + 1×1×1 / 3×3×3 convs) |
+| Extra dependencies | none (built on `nn.MultiheadAttention`) | none |
 
 ### 4. Decoder
 
@@ -156,7 +209,7 @@ single-timepoint UNet, except every skip connection now receives a *fused*
 feature map instead of a plain follow-up feature map:
 
 ```python
-*skips, bottleneck = fused            # fused[i] = CrossAttentionFusion applied at stage i
+*skips, bottleneck = fused            # fused[i] = fusion_blocks[i] applied at stage i
 d = bottleneck
 for i in range(len(dec_stages)):
     d = transpconvs[i](d)
@@ -169,16 +222,17 @@ supervision heads at intermediate decoder resolutions are not wired up here.
 
 ## Parameter reference
 
-`LongitudinalAttentionUNet(resenc_model, features_per_stage, n_classes=2, fusion_embed_dim=32, fusion_num_heads=4, fusion_patch_size=2, share_encoder=True, resenc_model_baseline=None)`
+`LongitudinalAttentionUNet(resenc_model, features_per_stage, n_classes=2, fusion_type="cross_attention", fusion_embed_dim=32, fusion_num_heads=4, fusion_patch_size=2, share_encoder=True, resenc_model_baseline=None)`
 
 | Argument | Meaning |
 |---|---|
 | `resenc_model` | Pretrained `ResidualEncoderUNet` (e.g. from `load_nnunet_weights`). Supplies the follow-up encoder and, always, the decoder. |
-| `features_per_stage` | Output channel count of each encoder stage, finest → bottleneck (from the nnU-Net plans; also returned by `load_nnunet_weights`). Used to size each `CrossAttentionFusion` block. |
+| `features_per_stage` | Output channel count of each encoder stage, finest → bottleneck (from the nnU-Net plans; also returned by `load_nnunet_weights`). Used to size each fusion block. |
 | `n_classes` | Number of segmentation classes (background included). |
-| `fusion_embed_dim` | Token embedding dimension `E` inside each `CrossAttentionFusion` block. |
-| `fusion_num_heads` | Number of attention heads in each `CrossAttentionFusion` block. |
-| `fusion_patch_size` | Patch size used to tokenize feature maps before attention (larger = fewer, coarser tokens = cheaper attention). |
+| `fusion_type` | `"cross_attention"` (default) or `"channel_attention"` — selects `CrossAttentionFusion` or `ChannelAttentionFusion` for every stage (see [Fusion mechanisms](#3-fusion-mechanisms-baseline-as-a-contextual-prompt)). See `model.FUSION_TYPES`. |
+| `fusion_embed_dim` | Token embedding dimension `E` inside each `CrossAttentionFusion` block. Ignored when `fusion_type="channel_attention"`. |
+| `fusion_num_heads` | Number of attention heads in each `CrossAttentionFusion` block. Ignored when `fusion_type="channel_attention"`. |
+| `fusion_patch_size` | Patch size used to tokenize feature maps before attention (larger = fewer, coarser tokens = cheaper attention). Ignored when `fusion_type="channel_attention"`. |
 | `share_encoder` | `True` → one weight-tied encoder for both time points. `False` → independent `encoder_followup` / `encoder_baseline`. |
 | `resenc_model_baseline` | Only used when `share_encoder=False`. If given, its `.encoder` seeds `encoder_baseline`; otherwise `encoder_baseline` is a deep copy of `resenc_model.encoder`. Must be `None` when `share_encoder=True`. |
 
@@ -192,18 +246,24 @@ python main.py
 `main.py` does not require any pretrained checkpoint: it builds a small
 randomly-initialised `ResidualEncoderUNet` (4 stages, CPU-friendly), then
 runs `LongitudinalAttentionUNet` on random `(2, 1, 32, 64, 64)` follow-up /
-baseline tensors for **both** `share_encoder=True` and `share_encoder=False`,
-asserting the output shape is `(2, n_classes, 32, 64, 64)` in each case and
-that the separate-encoder model has more parameters than the shared-encoder
-one.
+baseline tensors for **all four** combinations of `fusion_type`
+(`"cross_attention"` / `"channel_attention"`) × `share_encoder`
+(`True` / `False`), asserting the output shape is `(2, n_classes, 32, 64,
+64)` in every case, and that for each `fusion_type` the separate-encoder
+model has more parameters than the shared-encoder one.
 
-To use real pretrained weights instead of the random dummy encoder:
+To use real pretrained weights instead of the random dummy encoder, and to
+pick a fusion mechanism explicitly:
 
 ```python
 from model import load_nnunet_weights, LongitudinalAttentionUNet
 
 resenc_model, features_per_stage = load_nnunet_weights("/path/to/nnUNet_results/DatasetXXX/.../fold_0/..")
-model = LongitudinalAttentionUNet(resenc_model, features_per_stage, share_encoder=True)
+model = LongitudinalAttentionUNet(
+    resenc_model, features_per_stage,
+    fusion_type="channel_attention",  # or "cross_attention"
+    share_encoder=True,
+)
 logits = model(image_followup, image_baseline)
 ```
 
