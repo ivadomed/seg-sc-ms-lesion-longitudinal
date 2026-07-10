@@ -130,13 +130,14 @@ Concretely, for each resolution level:
    (`PatchEmbed3D`). Spatial dims are zero-padded up to a multiple of
    `patch_size` first, so this works for any input shape without crashing on
    odd/small volumes (relevant for the bottleneck, which can be very small).
-2. **Multi-head cross-attention** (`nn.MultiheadAttention`, batch-first):
-   follow-up tokens are the *query*, baseline tokens are *key* and *value*.
-   This lets every follow-up spatial location attend to the most relevant
-   baseline locations — not just the co-located voxel — which matters when
-   there is residual misalignment between time points. `need_weights=False`
-   routes PyTorch to the fused scaled-dot-product-attention kernel instead of
-   materialising the full `N × N` attention matrix.
+2. **Multi-head cross-attention** (MONAI's `CrossAttentionBlock`):
+   follow-up tokens are the *query* (`x`), baseline tokens are *key* and
+   *value* (`context`). This lets every follow-up spatial location attend to
+   the most relevant baseline locations — not just the co-located voxel —
+   which matters when there is residual misalignment between time points.
+   `use_flash_attention=True` routes it to PyTorch's fused
+   scaled-dot-product-attention kernel instead of materialising the full
+   `N × N` attention matrix.
 3. **Unpack** the attended tokens back to a spatial map (`PatchUnembed3D`:
    linear projection + reshape + `trilinear` interpolation back to the
    follow-up feature map's exact spatial shape).
