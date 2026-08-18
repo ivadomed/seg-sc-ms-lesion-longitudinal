@@ -17,26 +17,36 @@ sub-cal003 -> Calgary, sub-van004 -> Vancouver, sub-edm005 -> Edmonton), so
 canproco pairs are tagged with site "canproco-<city>" instead of a single
 "canproco" site.
 
+Derivative labels live under either <dataset>/derivatives/labels-ms-spinal-cord-only
+or, if that folder does not exist, <dataset>/derivatives/labels. The matching raw
+image lives at the same relative sub-X/ses-Y/anat path directly under <dataset>.
+
+Sessions follow either "ses-M<number>" (e.g. canproco) or "ses-<YYYYMMDD>" (e.g.
+ms-ucsf-2025); they are sorted chronologically accordingly, falling back to
+lexicographic order otherwise. Consecutive sessions (after exclusions) are paired,
+and within a pair, images/labels are matched by their shared BIDS entities (e.g.
+acq-ax_chunk-1_T2w) so only images that exist at both timepoints are paired.
+
+The dataset named in TEST_SET is held out entirely as an external test set; every
+other dataset's pairs are split into train/validation/test at the (site, subject)
+level.
+
 Arguments:
-    --data:    One or more BIDS dataset roots (space separated)
-    --sites:   Optional source label per dataset (defaults to each dataset
-               folder name); must match the number of --data paths if given
+    --data:    Path to a parent folder containing one or more BIDS datasets folder.
     --output:  Path to the output directory where dataset json is saved
-    --exclude: Optional path to a YAML file listing files to exclude (a flat
-               list of strings matched against each label file's path)
-    --seed:    Random seed for reproducibility
 
 Pierre-Louis Benveniste
 """
 
 import os
+import re
 import json
 import yaml
 from tqdm import tqdm
 import argparse
 from loguru import logger
 from sklearn.model_selection import train_test_split
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from collections import defaultdict
 
@@ -52,304 +62,230 @@ CANPROCO_SITE_PREFIXES = {
     "edm": "edmonton",
 }
 
+# Exclude file path
+EXCLUDE_FILE = Path(__file__).parent / "exclude.yml"
+
+# Let's set the seed for reproducibility
+seed = 42
+
 
 def get_parser():
     parser = argparse.ArgumentParser(description='Code for MSD-style JSON datalist for longitudinal lesion segmentation')
-    parser.add_argument('--data', type=str, required=True, nargs='+',
-                        help='One or more BIDS dataset roots (space separated). Pairs are built within each dataset.')
-    parser.add_argument('--sites', type=str, nargs='+', default=None,
-                        help='Optional source label per dataset (defaults to the dataset folder name). '
-                             'If given, must match the number of --data paths.')
+    parser.add_argument('--data', type=str, required=True,
+                        help='Path to a parent folder containing one or more BIDS datasets folder')
     parser.add_argument('--output', type=str, required=True, help='Path to the output directory where dataset json is saved')
-    parser.add_argument('--exclude', type=str, default=None,
-                        help='Path to a YAML file listing files to exclude: a flat list of strings, '
-                             'each matched as a substring against every label file path found under --data.')
-    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
     return parser
 
 
 def load_exclude_list(exclude_path: str) -> list:
     """Loads a flat list of strings from a YAML exclude file. Returns [] if no path is given."""
-    if exclude_path is None:
-        return []
-    with open(exclude_path) as f:
-        exclude_list = yaml.safe_load(f) or []
-    if not isinstance(exclude_list, list):
-        raise ValueError(f"Exclude file {exclude_path} must contain a YAML list of strings")
+    with open(exclude_path, 'r') as f:
+        exclude_list = yaml.load(f, Loader=yaml.FullLoader)
+    exclude_list = exclude_list["to_exclude"]
     return exclude_list
 
 
-def is_excluded(derivative_path: Path, exclude_list: list) -> bool:
-    """True if any exclude entry is a substring of the derivative's path."""
-    path_str = str(derivative_path)
-    return any(pattern in path_str for pattern in exclude_list)
+def find_labels_root(dataset_path: Path) -> Path:
+    """Returns the derivatives folder holding lesion labels for a dataset."""
+    cord_only_root = dataset_path / "derivatives" / "labels-ms-spinal-cord-only"
+    if cord_only_root.exists():
+        return cord_only_root
+    return dataset_path / "derivatives" / "labels"
 
 
-def resolve_site(subject: str, dataset_site: str) -> str:
-    """
-    canproco pools multiple acquisition sites under one dataset root,
-    distinguished by subject ID prefix (e.g. sub-tor001 -> Toronto). Splits
-    them into distinct sites so subject-level splitting stays correct.
-    """
-    if dataset_site == "canproco":
-        for prefix, name in CANPROCO_SITE_PREFIXES.items():
-            if subject.startswith(f"sub-{prefix}"):
-                return f"canproco-{name}"
-        logger.warning(
-            f"canproco subject {subject} does not match a known site prefix "
-            f"{sorted(CANPROCO_SITE_PREFIXES)}; keeping site 'canproco'"
-        )
-    return dataset_site
+def derive_image_path(label_file: Path, labels_root: Path, dataset_path: Path) -> Path:
+    """Maps a derivative label file to its matching raw image path under the dataset root."""
+    relative = label_file.relative_to(labels_root)
+    image_name = relative.name.replace("_label-lesion_seg.nii.gz", ".nii.gz")
+    return dataset_path / relative.parent / image_name
 
 
-def get_session_date(derivative_path: Path) -> str:
-    """
-    Extracts the session date string (e.g. '20231121') from a BIDS path containing 'ses-YYYYMMDD'.
-    Returns the raw string so it can be sorted lexicographically (ISO date format sorts correctly).
-    """
-    for part in derivative_path.parts:
-        if part.startswith('ses-'):
-            return part.replace('ses-', '')
-    return ''
+def get_entity_key(filename: str, subject_id: str, ses_full: str) -> str:
+    """Returns the BIDS entities (contrast/acq/chunk...) of a label filename, stripped of
+    the subject, session and label suffix, so that images can be matched across sessions."""
+    key = filename.replace("_label-lesion_seg.nii.gz", "")
+    prefix = f"{subject_id}_{ses_full}_"
+    if key.startswith(prefix):
+        key = key[len(prefix):]
+    return key
 
 
-def get_contrast(derivative_path: Path) -> str:
-    """Extracts the contrast identifier from the filename (last underscore-separated token before .nii.gz)."""
-    return derivative_path.name.replace('_label-lesion_seg.nii.gz', '.nii.gz').replace('_lesion-manual.nii.gz', '.nii.gz').split('_')[-1].replace('.nii.gz', '')
+def session_sort_key(ses_full: str):
+    """Returns a sortable chronological key for a BIDS session label.
+    Handles ses-M<number> (month offset) and ses-<YYYYMMDD> (calendar date),
+    falling back to lexicographic order for anything else."""
+    ses_label = ses_full.replace("ses-", "")
+    month_match = re.fullmatch(r"M(\d+)", ses_label)
+    if month_match:
+        return (0, int(month_match.group(1)))
+    date_match = re.fullmatch(r"\d{8}", ses_label)
+    if date_match:
+        return (1, datetime.strptime(ses_label, "%Y%m%d"))
+    return (2, ses_label)
 
 
-def get_subject(derivative_path: Path) -> str:
-    """Extracts the subject ID from the filename."""
-    return derivative_path.name.split('_')[0]
+def get_site(dataset_name: str, subject_id: str) -> str:
+    """Returns the site name for a subject, splitting canproco into its pooled sites."""
+    if dataset_name == "canproco":
+        prefix = subject_id.replace("sub-", "")[:3]
+        city = CANPROCO_SITE_PREFIXES.get(prefix)
+        if city is None:
+            logger.warning(f"Unknown canproco site prefix for subject {subject_id}, using dataset name as site")
+            return dataset_name
+        return f"canproco-{city}"
+    return dataset_name
 
 
-def get_chunk(derivative_path: Path) -> str:
-    """
-    Extracts the chunk identifier (e.g. 'chunk-2') from a BIDS filename, or '' if
-    none is present. Used to keep different chunks of the same subject/contrast
-    (e.g. bavaria 'sub-m776721_ses-20210208_acq-ax_chunk-2_T2w.nii.gz') from being
-    paired together.
-    """
-    for token in derivative_path.name.split('_'):
-        if token.startswith('chunk-'):
-            return token
-    return ''
+def build_dataset_pairs(dataset_name: str, dataset_path: Path, exclude_list: list) -> list:
+    """Builds the longitudinal pairs for a single BIDS dataset, independently of any other dataset."""
+    labels_root = find_labels_root(dataset_path)
+    if not labels_root.exists():
+        logger.warning(f"No derivatives labels folder found for {dataset_name}, skipping")
+        return []
+
+    label_files = sorted(labels_root.rglob("*_label-lesion_seg.nii.gz"))
+
+    # sessions_by_subject[subject_id][ses_full] -> list of {"image", "label", "entity_key"}
+    sessions_by_subject = defaultdict(lambda: defaultdict(list))
+
+    for label_file in label_files:
+        relative = label_file.relative_to(labels_root)
+        if len(relative.parts) < 3 or not relative.parts[1].startswith("ses-"):
+            logger.warning(f"Skipping {label_file}: expected a sub-X/ses-Y/anat structure")
+            continue
+
+        subject_id, ses_full = relative.parts[0], relative.parts[1]
+        if f"{subject_id}_{ses_full}" in exclude_list:
+            continue
+
+        image_path = derive_image_path(label_file, labels_root, dataset_path)
+        if not image_path.exists():
+            logger.warning(f"Image not found for label {label_file}")
+            continue
+
+        entity_key = get_entity_key(relative.name, subject_id, ses_full)
+        sessions_by_subject[subject_id][ses_full].append({
+            "label": str(label_file),
+            "image": str(image_path),
+            "entity_key": entity_key,
+        })
+
+    dataset_pairs = []
+    for subject_id, sessions in sessions_by_subject.items():
+        site = get_site(dataset_name, subject_id)
+        ordered_sessions = sorted(sessions.keys(), key=session_sort_key)
+
+        for ses_a, ses_b in zip(ordered_sessions, ordered_sessions[1:]):
+            entities_a = {item["entity_key"]: item for item in sessions[ses_a]}
+            entities_b = {item["entity_key"]: item for item in sessions[ses_b]}
+
+            for key in sorted(entities_a.keys() & entities_b.keys()):
+                dataset_pairs.append({
+                    "images": [entities_a[key]["image"], entities_b[key]["image"]],
+                    "labels": [entities_a[key]["label"], entities_b[key]["label"]],
+                    "sessions": [ses_a, ses_b],
+                    "subject": subject_id,
+                    "site": site,
+                })
+
+    logger.info(f"{dataset_name}: built {len(dataset_pairs)} longitudinal pairs")
+    return dataset_pairs
 
 
-def build_longitudinal_pairs(derivatives: list, site: str) -> list:
-    """
-    Groups derivatives by (subject, contrast, chunk), sorts sessions
-    chronologically, and builds consecutive pairs (session N, session N+1).
-
-    Grouping on contrast guarantees both images of a pair share the same
-    contrast; grouping on chunk keeps different chunks of the same
-    subject/contrast (e.g. bavaria acq-ax chunk-1 vs chunk-2) from being paired.
-
-    Each pair is a dict with:
-        image1, label1  -> earlier timepoint
-        image2, label2  -> later timepoint
-        subject, contrast, chunk, session1, session2, site
-
-    canproco subjects are re-tagged per-subject via resolve_site() into
-    "canproco-<city>" instead of the dataset-level site.
-
-    Only pairs where all four files exist on disk are included.
-
-    Input:
-        derivatives : list[Path] : all label files found under one dataset
-        site        : str        : source label written into each pair
-
-    Returns:
-        pairs : list[dict]
-    """
-    # Group by (subject, contrast, chunk)
-    groups = defaultdict(list)
-    for deriv in derivatives:
-        subject  = get_subject(deriv)
-        contrast = get_contrast(deriv)
-        chunk    = get_chunk(deriv)
-        session  = get_session_date(deriv)
-        groups[(subject, contrast, chunk)].append((session, deriv))
-
-    pairs = []
-    # We iterate over groups of same subject/contrast/chunk, sort by session date, and build consecutive pairs
-    for (subject, contrast, chunk), entries in groups.items():
-        # Sort by session date (lexicographic sort works for YYYYMMDD)
-        entries_sorted = sorted(entries, key=lambda x: x[0])
-
-        for i in range(len(entries_sorted) - 1):
-            ses1, label1_path = entries_sorted[i]
-            ses2, label2_path = entries_sorted[i + 1]
-
-            image1_path = str(label1_path).replace('_label-lesion_seg.nii.gz', '.nii.gz').replace('derivatives/labels/', '')
-            image2_path = str(label2_path).replace('_label-lesion_seg.nii.gz', '.nii.gz').replace('derivatives/labels/', '')
-
-            if site=="canproco" or site=="bavaria":
-                image1_path = str(label1_path).replace('_lesion-manual.nii.gz', '.nii.gz').replace('derivatives/labels/', '')
-                image2_path = str(label2_path).replace('_lesion-manual.nii.gz', '.nii.gz').replace('derivatives/labels/', '')
-
-            # Only keep pairs where all four files exist
-            if not all(os.path.exists(p) for p in [str(label1_path), str(label2_path), image1_path, image2_path]):
-                missing = [p for p in [str(label1_path), str(label2_path), image1_path, image2_path] if not os.path.exists(p)]
-                logger.warning(f"Skipping pair ({site}, {subject}, {contrast}, {chunk}, {ses1}->{ses2}): missing files: {missing}")
-                continue
-
-            pair_site = resolve_site(subject, site)
-
-            pairs.append({
-                "image1":    image1_path,
-                "label1":    str(label1_path),
-                "image2":    image2_path,
-                "label2":    str(label2_path),
-                "subject":   subject,
-                "contrast":  contrast,
-                "chunk":     chunk,
-                "session1":  ses1,
-                "session2":  ses2,
-                "site":      pair_site,
-            })
-
-    return pairs
-
-
-def _split_key(pair: dict) -> tuple:
-    """Composite identity used for splitting: a subject is unique within its site."""
-    return (pair["site"], pair["subject"])
-
-
-def split_pairs_by_subject(pairs: list, test_size: float = 0.1, random_state: int = 42):
-    """
-    Splits pairs into train / val / test by (site, subject) — no subject from a
-    given cohort appears in two splits, and identical subject IDs from different
-    cohorts are treated as distinct.
-
-    Input:
-        pairs        : list[dict] : pooled output of build_longitudinal_pairs()
-        test_size    : float      : fraction of subjects held out for test (and for val)
-        random_state : int
-
-    Returns:
-        train, val, test : list[dict]
-    """
-    subjects = list({_split_key(p) for p in pairs})
-
-    subj_train, subj_test = train_test_split(subjects, test_size=test_size, random_state=random_state)
-    subj_train, subj_val  = train_test_split(subj_train, test_size=test_size / (1 - test_size), random_state=random_state)
-
-    subj_train = set(subj_train)
-    subj_val   = set(subj_val)
-    subj_test  = set(subj_test)
-
-    train = [p for p in pairs if _split_key(p) in subj_train]
-    val   = [p for p in pairs if _split_key(p) in subj_val]
-    test  = [p for p in pairs if _split_key(p) in subj_test]
-
-    return train, val, test
-
-
-def print_pairs_distribution(pairs: list, split_name: str):
-    """Logs site + contrast distribution and subject count for a given split."""
-    contrasts = [p["contrast"] for p in pairs]
-    sites     = [p["site"] for p in pairs]
-    subjects  = {_split_key(p) for p in pairs}
-    logger.info(f"[{split_name}] {len(pairs)} pairs | {len(subjects)} subjects")
-    for s in sorted(set(sites)):
-        n_site = sites.count(s)
-        n_subj = len({p["subject"] for p in pairs if p["site"] == s})
-        logger.info(f"  site {s}: {n_site} pairs | {n_subj} subjects")
-    for c in sorted(set(contrasts)):
-        logger.info(f"  contrast {c}: {contrasts.count(c)} pairs")
+def split_subjects(subjects: list, test_size: float, random_state: int):
+    """Splits a list of subjects into train/validation/test. Too few subjects to split
+    meaningfully (< 3) all go to train."""
+    subjects = sorted(subjects)
+    if len(subjects) < 3:
+        return subjects, [], []
+    train, test = train_test_split(subjects, test_size=test_size, random_state=random_state)
+    train, val = train_test_split(train, test_size=test_size / (1 - test_size), random_state=random_state)
+    return sorted(train), sorted(val), sorted(test)
 
 
 def main():
     parser = get_parser()
     args = parser.parse_args()
-    data_paths  = args.data
+    data_path  = Path(args.data)
     output_path = args.output
     test_size   = 0.1
 
-    # Resolve a source label for each dataset (folder name by default).
-    if args.sites is not None:
-        if len(args.sites) != len(data_paths):
-            parser.error(f"--sites ({len(args.sites)}) must match the number of --data paths ({len(data_paths)})")
-        sites = args.sites
-    else:
-        sites = [Path(p.rstrip('/')).name for p in data_paths]
-    if len(set(sites)) != len(sites):
-        parser.error(f"Duplicate site labels {sites}; pass distinct --sites so cohorts stay separable.")
-
-    exclude_list = load_exclude_list(args.exclude)
+    # Load exclude list
+    exclude_list = load_exclude_list(EXCLUDE_FILE)
     if exclude_list:
-        logger.info(f"Loaded {len(exclude_list)} exclude pattern(s) from {args.exclude}")
+        logger.info(f"Loaded {len(exclude_list)} exclude patterns from {EXCLUDE_FILE}")
 
-    # ------------------------------------------------------------------ #
-    # 1-2. Discover labels and build consecutive pairs, per dataset
-    # ------------------------------------------------------------------ #
-    all_pairs = []
-    for data_path, site in zip(data_paths, sites):
-        derivatives = list(Path(data_path).rglob('*_label-lesion_seg.nii.gz'))
-        if site=="canproco" or site=="bavaria":
-            derivatives = list(Path(data_path).rglob('*_lesion-manual.nii.gz'))
-        logger.info(f"[{site}] Found {len(derivatives)} label files under {data_path}")
+    # List all BIDS datasets (list of all folder in the data input path)
+    datasets = sorted(d for d in os.listdir(data_path) if (data_path / d).is_dir())
+    logger.info(f"Found {len(datasets)} datasets: {datasets}")
 
-        if exclude_list:
-            n_before = len(derivatives)
-            derivatives = [d for d in derivatives if not is_excluded(d, exclude_list)]
-            logger.info(f"[{site}] Excluded {n_before - len(derivatives)} label file(s) via --exclude")
+    # Build longitudinal pairs independently for each dataset, keeping the held-out
+    # external test set separate from the pool that gets split into train/val/test.
+    external_test_pairs = []
+    pool_pairs = []
 
-        site_pairs = build_longitudinal_pairs(derivatives, site=site)
-        logger.info(f"[{site}] Built {len(site_pairs)} valid consecutive pairs")
-        all_pairs.extend(site_pairs)
+    for dataset_name in tqdm(datasets, desc="Building pairs per dataset"):
+        dataset_pairs = build_dataset_pairs(dataset_name, data_path / dataset_name, exclude_list)
+        if dataset_name == TEST_SET:
+            external_test_pairs.extend(dataset_pairs)
+        else:
+            pool_pairs.extend(dataset_pairs)
 
-    logger.info(f"Pooled {len(all_pairs)} pairs from {len(data_paths)} dataset(s): {sites}")
+    # Split the pooled pairs into train/validation/test at the (site, subject) level,
+    # so a subject's pairs never end up split across two sets.
+    pairs_by_site = defaultdict(list)
+    for pair in pool_pairs:
+        pairs_by_site[pair["site"]].append(pair)
 
-    # ------------------------------------------------------------------ #
-    # 3. Train / val / test split (per-cohort subject level)
-    # ------------------------------------------------------------------ #
-    train_pairs, val_pairs, test_pairs = split_pairs_by_subject(
-        all_pairs, test_size=test_size, random_state=args.seed
-    )
+    train_pairs, val_pairs, test_pairs = [], [], []
+    for site, site_pairs in pairs_by_site.items():
+        subjects = {p["subject"] for p in site_pairs}
+        train_subjects, val_subjects, test_subjects = split_subjects(subjects, test_size, seed)
+        for pair in site_pairs:
+            if pair["subject"] in train_subjects:
+                train_pairs.append(pair)
+            elif pair["subject"] in val_subjects:
+                val_pairs.append(pair)
+            else:
+                test_pairs.append(pair)
+        logger.info(f"Site {site}: {len(train_subjects)} train / {len(val_subjects)} val / {len(test_subjects)} test subjects")
 
-    for split_name, split_pairs in [("train", train_pairs), ("validation", val_pairs), ("test", test_pairs)]:
-        print_pairs_distribution(split_pairs, split_name)
+    train_pairs = sorted(train_pairs, key=lambda p: (p["site"], p["subject"], p["sessions"]))
+    val_pairs = sorted(val_pairs, key=lambda p: (p["site"], p["subject"], p["sessions"]))
+    test_pairs = sorted(test_pairs, key=lambda p: (p["site"], p["subject"], p["sessions"]))
+    external_test_pairs = sorted(external_test_pairs, key=lambda p: (p["site"], p["subject"], p["sessions"]))
 
-    # ------------------------------------------------------------------ #
-    # 4. Assemble the JSON
-    # ------------------------------------------------------------------ #
-    params = {
-        "description":        "ms-lesion-longitudinal",
-        "labels":             {"0": "background", "1": "ms-lesion-seg"},
-        "license":            "plb",
-        "modality":           {"0": "MRI"},
-        "name":               "ms-lesion-longitudinal",
-        "seed":               args.seed,
-        "reference":          "NeuroPoly",
-        "tensorImageSize":    "3D",
-        "task":               "consecutive-pair segmentation",
-        "sites":              sorted({p["site"] for p in all_pairs}),
-        "train":              train_pairs,
-        "validation":         val_pairs,
-        "test":               test_pairs,
-        "numTraining":        len(train_pairs),
-        "numValidation":      len(val_pairs),
-        "numTest":            len(test_pairs),
-        "numSubjects":        len({_split_key(p) for p in all_pairs}),
+    params = {}
+    params["description"] = "ms-lesion-longitudinal"
+    params["labels"] = {
+        "0": "background",
+        "1": "ms-lesion-seg",
     }
+    params["license"] = "plb"
+    params["modality"] = {
+        "0": "MRI",
+    }
+    params["name"] = "ms-lesion-longitudinal"
+    params["seed"] = seed
+    params["reference"] = "NeuroPoly"
+    params["tensorImageSize"] = "3D"
+    params["train"] = train_pairs
+    params["validation"] = val_pairs
+    params["test"] = test_pairs
+    params["externalTest"] = external_test_pairs
+    params["numTrain"] = len(train_pairs)
+    params["numValidation"] = len(val_pairs)
+    params["numTest"] = len(test_pairs)
+    params["numExternalTest"] = len(external_test_pairs)
 
-    total = params["numTraining"] + params["numValidation"] + params["numTest"]
-    logger.info(f"Total pairs in dataset: {total}")
-    logger.info(f"Total unique subjects:  {params['numSubjects']}")
+    logger.info(f"Number of pairs -- train: {params['numTrain']}, validation: {params['numValidation']}, "
+                f"test: {params['numTest']}, external test ({TEST_SET}): {params['numExternalTest']}")
 
-    # ------------------------------------------------------------------ #
-    # 5. Write outputs
-    # ------------------------------------------------------------------ #
     os.makedirs(output_path, exist_ok=True)
-    today = str(date.today())
-
-    json_path = os.path.join(output_path, f"dataset_{today}.json")
-    with open(json_path, "w") as f:
-        f.write(json.dumps(params, indent=4, sort_keys=True))
-    logger.info(f"Dataset JSON saved to {json_path}")
+    output_file = Path(output_path) / f"dataset_{date.today()}_seed{seed}.json"
+    with open(output_file, "w") as f:
+        json.dump(params, f, indent=4, sort_keys=True)
+    logger.info(f"Saved dataset json to {output_file}")
 
 
 if __name__ == "__main__":
