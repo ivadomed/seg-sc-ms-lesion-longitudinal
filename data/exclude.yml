@@ -1,4 +1,4 @@
-canproco:
+to_exclude:
 - sub-cal149_ses-M0    # FOV does not cover the whole SC in sagittal plane; see https://github.com/ivadomed/canproco/issues/22#issue-1568568207
 - sub-cal134_ses-M12   # Blurry image: see https://github.com/ivadomed/seg-sc-ms-lesion-longitudinal/issues/15#issuecomment-5329191908
 - sub-mon006_ses-M12   # FOV covers the whole brain. The SC has only C1-C6; see https://github.com/ivadomed/canproco/issues/22#issue-1568568207 # image was moved from M0 to M12; see https://github.com/ivadomed/canproco/issues/39
