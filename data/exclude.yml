@@ -1,6 +1,7 @@
 to_exclude:
 - sub-cal149_ses-M0    # FOV does not cover the whole SC in sagittal plane; see https://github.com/ivadomed/canproco/issues/22#issue-1568568207
 - sub-cal134_ses-M12   # Blurry image: see https://github.com/ivadomed/seg-sc-ms-lesion-longitudinal/issues/15#issuecomment-5329191908
+- sub-mon006_ses-M0    # Blurry image: see https://github.com/ivadomed/seg-sc-ms-lesion-longitudinal/issues/15#issuecomment-5368177201
 - sub-mon006_ses-M12   # FOV covers the whole brain. The SC has only C1-C6; see https://github.com/ivadomed/canproco/issues/22#issue-1568568207 # image was moved from M0 to M12; see https://github.com/ivadomed/canproco/issues/39
 - sub-mon009_ses-M12   # Poor data quality; see https://github.com/ivadomed/canproco/issues/53#issuecomment-1758684880 # image was moved from M0 to M12; see https://github.com/ivadomed/canproco/issues/39
 - sub-mon029_ses-M0    # Poor data quality; see https://github.com/ivadomed/canproco/issues/53#issuecomment-2147882477
@@ -31,3 +32,34 @@ to_exclude:
 - sub-van207_ses-M0    # No disc labeling file : impossible to do it : https://github.com/ivadomed/canproco/issues/53#issuecomment-1761973064
 - sub-tor014_ses-M12   # Poor data quality and no disc labeling file; see https://github.com/ivadomed/canproco/issues/53#issuecomment-1760420705  # image was moved from M0 to M12; see https://github.com/ivadomed/canproco/issues/39
 - sub-tor133_ses-M0    # Poor data quality; see https://github.com/ivadomed/canproco/issues/53#issuecomment-1758689928
+- sub-cal134_ses-M12   # Blurry image: see https://github.com/ivadomed/seg-sc-ms-lesion-longitudinal/issues/15#issuecomment-5329191908
+- sub-edm126_ses-M12   # Blurry iamge: see https://github.com/ivadomed/seg-sc-ms-lesion-longitudinal/issues/15#issuecomment-5358635007
+- sub-edm183_ses-M12   # Blurry iamge: see https://github.com/ivadomed/seg-sc-ms-lesion-longitudinal/issues/15#issuecomment-5358635007
+- sub-mon005_ses-M12   # Blurry iamge: see https://github.com/ivadomed/seg-sc-ms-lesion-longitudinal/issues/15#issuecomment-5358635007
+- sub-mon009_ses-M12   # Black and white inversion: see https://github.com/ivadomed/seg-sc-ms-lesion-longitudinal/issues/15#issuecomment-5358635007
+- sub-mon010_ses-M12   # Black and white inversion: see https://github.com/ivadomed/seg-sc-ms-lesion-longitudinal/issues/15#issuecomment-5358635007
+- sub-mon032_ses-M12   # Black and white inversion: see https://github.com/ivadomed/seg-sc-ms-lesion-longitudinal/issues/15#issuecomment-5358635007
+- sub-mon055_ses-M12   # Black and white inversion: see https://github.com/ivadomed/seg-sc-ms-lesion-longitudinal/issues/15#issuecomment-5358635007
+- sub-mon072_ses-M12   # Blurry iamge: see https://github.com/ivadomed/seg-sc-ms-lesion-longitudinal/issues/15#issuecomment-5358635007
+- sub-mon096_ses-M12   # Black and white inversion: see https://github.com/ivadomed/seg-sc-ms-lesion-longitudinal/issues/15#issuecomment-5358635007
+- sub-mon097_ses-M12   # Blurry iamge: see https://github.com/ivadomed/seg-sc-ms-lesion-longitudinal/issues/15#issuecomment-5358635007
+- sub-mon108_ses-M12   # Blurry iamge: see https://github.com/ivadomed/seg-sc-ms-lesion-longitudinal/issues/15#issuecomment-5358635007
+- sub-mon138_ses-M12   # Blurry iamge: see https://github.com/ivadomed/seg-sc-ms-lesion-longitudinal/issues/15#issuecomment-5358635007
+- sub-mon148_ses-M12   # Blurry iamge: see https://github.com/ivadomed/seg-sc-ms-lesion-longitudinal/issues/15#issuecomment-5358635007
+- sub-mon150_ses-M12   # Black and white inversion: see https://github.com/ivadomed/seg-sc-ms-lesion-longitudinal/issues/15#issuecomment-5358635007
+- sub-mon165_ses-M12   # Blurry iamge: see https://github.com/ivadomed/seg-sc-ms-lesion-longitudinal/issues/15#issuecomment-5358635007
+- sub-mon185_ses-M12   # Black and white inversion: see https://github.com/ivadomed/seg-sc-ms-lesion-longitudinal/issues/15#issuecomment-5358635007
+- sub-mon190_ses-M12   # Blurry iamge: see https://github.com/ivadomed/seg-sc-ms-lesion-longitudinal/issues/15#issuecomment-5358635007
+- sub-mon198_ses-M12   # Blurry iamge: see https://github.com/ivadomed/seg-sc-ms-lesion-longitudinal/issues/15#issuecomment-5358635007
+- sub-tor014_ses-M12   # Blurry iamge: see https://github.com/ivadomed/seg-sc-ms-lesion-longitudinal/issues/15#issuecomment-5358635007
+- sub-tor057_ses-M12   # Blurry iamge: see https://github.com/ivadomed/seg-sc-ms-lesion-longitudinal/issues/15#issuecomment-5358635007
+- sub-tor141_ses-M12   # Blurry iamge: see https://github.com/ivadomed/seg-sc-ms-lesion-longitudinal/issues/15#issuecomment-5358635007
+- sub-van158_ses-M12   # Blurry iamge: see https://github.com/ivadomed/seg-sc-ms-lesion-longitudinal/issues/15#issuecomment-5358635007
+- sub-van159_ses-M12   # Black and white inversion: see https://github.com/ivadomed/seg-sc-ms-lesion-longitudinal/issues/15#issuecomment-5358635007
+- sub-van161_ses-M12   # Blurry iamge: see https://github.com/ivadomed/seg-sc-ms-lesion-longitudinal/issues/15#issuecomment-5358635007
+- sub-van177_ses-M12   # Blurry iamge: see https://github.com/ivadomed/seg-sc-ms-lesion-longitudinal/issues/15#issuecomment-5358635007
+- sub-van191_ses-M12   # Blurry iamge: see https://github.com/ivadomed/seg-sc-ms-lesion-longitudinal/issues/15#issuecomment-5358635007
+- sub-van201_ses-M12   # Blurry iamge: see https://github.com/ivadomed/seg-sc-ms-lesion-longitudinal/issues/15#issuecomment-5358635007
+- sub-van206_ses-M12   # Blurry iamge: see https://github.com/ivadomed/seg-sc-ms-lesion-longitudinal/issues/15#issuecomment-5358635007
+- sub-van211_ses-M12   # Blurry iamge: see https://github.com/ivadomed/seg-sc-ms-lesion-longitudinal/issues/15#issuecomment-5358635007
+- sub-van221_ses-M12   # Blurry iamge: see https://github.com/ivadomed/seg-sc-ms-lesion-longitudinal/issues/15#issuecomment-5358635007
