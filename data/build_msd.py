@@ -48,7 +48,7 @@ from loguru import logger
 from sklearn.model_selection import train_test_split
 from datetime import date, datetime
 from pathlib import Path
-from collections import defaultdict
+from collections import defaultdict, Counter
 
 
 TEST_SET = "ms-ucsf-2025"
@@ -96,7 +96,7 @@ def find_labels_root(dataset_path: Path) -> Path:
 def derive_image_path(label_file: Path, labels_root: Path, dataset_path: Path) -> Path:
     """Maps a derivative label file to its matching raw image path under the dataset root."""
     relative = label_file.relative_to(labels_root)
-    image_name = relative.name.replace("_label-lesion_seg.nii.gz", ".nii.gz")
+    image_name = relative.name.replace("_label-lesion_seg.nii.gz", ".nii.gz").replace("_desc-rater2", "")
     return dataset_path / relative.parent / image_name
 
 
@@ -144,6 +144,8 @@ def build_dataset_pairs(dataset_name: str, dataset_path: Path, exclude_list: lis
         return []
 
     label_files = sorted(labels_root.rglob("*_label-lesion_seg.nii.gz"))
+    # Remove labels with "_desc-rater1_"
+    label_files = [f for f in label_files if "_desc-rater1_" not in f.name]
 
     # sessions_by_subject[subject_id][ses_full] -> list of {"image", "label", "entity_key"}
     sessions_by_subject = defaultdict(lambda: defaultdict(list))
@@ -160,7 +162,7 @@ def build_dataset_pairs(dataset_name: str, dataset_path: Path, exclude_list: lis
 
         image_path = derive_image_path(label_file, labels_root, dataset_path)
         if not image_path.exists():
-            logger.warning(f"Image not found for label {label_file}")
+            logger.warning(f"Image {image_path} not found for label {label_file}")
             continue
 
         entity_key = get_entity_key(relative.name, subject_id, ses_full)
@@ -186,10 +188,91 @@ def build_dataset_pairs(dataset_name: str, dataset_path: Path, exclude_list: lis
                     "sessions": [ses_a, ses_b],
                     "subject": subject_id,
                     "site": site,
+                    "entity_key": key,
                 })
 
     logger.info(f"{dataset_name}: built {len(dataset_pairs)} longitudinal pairs")
     return dataset_pairs
+
+
+def parse_contrast(entity_key: str) -> str:
+    """Returns the BIDS contrast (suffix) from a pair's entity key, e.g. 'acq-ax_chunk-1_T2w' -> 'T2w'."""
+    return entity_key.split("_")[-1]
+
+
+def parse_orientation(entity_key: str) -> str:
+    """Returns the BIDS acquisition orientation (acq- entity) from a pair's entity key, if present.
+    PSIR and STIR are always acquired sagittally, even when untagged by an acq- entity."""
+    if parse_contrast(entity_key) in ("PSIR", "STIR"):
+        return "sag"
+    match = re.search(r"acq-([A-Za-z0-9]+)", entity_key)
+    if match:
+        return match.group(1)
+    return "not_specified"
+
+
+def _write_group_stats(lines: list, group_pairs: list, breakdown_label: str, breakdown: dict):
+    """Appends subject/contrast/orientation stats for one group of pairs, plus a
+    pair-count breakdown (e.g. by split, or by dataset) to lines."""
+    subjects = {pair["subject"] for pair in group_pairs}
+    contrasts = Counter(parse_contrast(pair["entity_key"]) for pair in group_pairs)
+    orientations = Counter(parse_orientation(pair["entity_key"]) for pair in group_pairs)
+
+    lines.append(f"    Pairs: {len(group_pairs)}")
+    lines.append(f"    Subjects: {len(subjects)}")
+    lines.append("    Contrasts: " + ", ".join(f"{k}={v}" for k, v in sorted(contrasts.items())))
+    lines.append("    Acquisition orientation: " + ", ".join(f"{k}={v}" for k, v in sorted(orientations.items())))
+    lines.append(f"    By {breakdown_label}: " + ", ".join(f"{k}={v}" for k, v in sorted(breakdown.items())))
+    lines.append("")
+
+
+def build_analysis_text(splits: dict) -> str:
+    """Builds a human-readable report with two analyses: the distribution of contrasts,
+    subjects and acquisition orientations grouped per dataset, and the same grouped per
+    split, from pairs carrying an entity_key."""
+    all_pairs = [pair for pairs in splits.values() for pair in pairs]
+
+    lines = [
+        "MSD Dataset Analysis",
+        "=" * 60,
+        f"Generated: {datetime.now().isoformat(timespec='seconds')}",
+        "",
+    ]
+
+    # --- Analysis per dataset ---
+    lines.append("=" * 60)
+    lines.append("PER DATASET")
+    lines.append("=" * 60)
+    lines.append("")
+
+    pairs_by_site = defaultdict(list)
+    for pair in all_pairs:
+        pairs_by_site[pair["site"]].append(pair)
+
+    for site in sorted(pairs_by_site):
+        site_pairs = pairs_by_site[site]
+        split_breakdown = Counter(
+            split_name for split_name, pairs in splits.items() for pair in pairs if pair["site"] == site
+        )
+        lines.append(f"Dataset: {site}")
+        _write_group_stats(lines, site_pairs, "split", split_breakdown)
+
+    # --- Analysis per split ---
+    lines.append("=" * 60)
+    lines.append("PER SPLIT")
+    lines.append("=" * 60)
+    lines.append("")
+
+    for split_name, pairs in splits.items():
+        lines.append(f"Split: {split_name}")
+        if not pairs:
+            lines.append("    (no pairs)")
+            lines.append("")
+            continue
+        dataset_breakdown = Counter(pair["site"] for pair in pairs)
+        _write_group_stats(lines, pairs, "dataset", dataset_breakdown)
+
+    return "\n".join(lines)
 
 
 def split_subjects(subjects: list, test_size: float, random_state: int):
@@ -255,6 +338,17 @@ def main():
     test_pairs = sorted(test_pairs, key=lambda p: (p["site"], p["subject"], p["sessions"]))
     external_test_pairs = sorted(external_test_pairs, key=lambda p: (p["site"], p["subject"], p["sessions"]))
 
+    analysis_text = build_analysis_text({
+        "train": train_pairs,
+        "validation": val_pairs,
+        "test": test_pairs,
+        "externalTest": external_test_pairs,
+    })
+
+    # entity_key is only used for the analysis report, drop it from the JSON pairs
+    for pair in train_pairs + val_pairs + test_pairs + external_test_pairs:
+        del pair["entity_key"]
+
     params = {}
     params["description"] = "ms-lesion-longitudinal"
     params["labels"] = {
@@ -286,6 +380,11 @@ def main():
     with open(output_file, "w") as f:
         json.dump(params, f, indent=4, sort_keys=True)
     logger.info(f"Saved dataset json to {output_file}")
+
+    analysis_file = Path(output_path) / f"dataset_{date.today()}_seed{seed}_analysis.txt"
+    with open(analysis_file, "w") as f:
+        f.write(analysis_text)
+    logger.info(f"Saved dataset analysis to {analysis_file}")
 
 
 if __name__ == "__main__":
