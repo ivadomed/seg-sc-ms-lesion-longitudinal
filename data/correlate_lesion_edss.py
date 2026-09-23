@@ -3,12 +3,30 @@ This script correlates the longitudinal change in spinal cord lesion volume
 (M0 -> M12) with the longitudinal change in EDSS sub-scores, for the canproco
 dataset.
 
-For each subject with a lesion segmentation at both ses-M0 and ses-M12 under
-<data>/derivatives/labels-ms-spinal-cord-only, the lesion volume (mm3) is
-computed at each timepoint from the binary segmentation mask. The subject is
-matched to its EDSS records via the SC_ID column of the EDSS csv (SC_ID is
-expected to hold the subject id without the "sub-" prefix, e.g. "van222" for
-"sub-van222"), and the EDSS sub-scores are read at the row where
+Lesion volumes are computed from either the MANUAL lesion labels or from
+lesion segmentations PREDICTED by sct_deepseg (task lesion_ms, with
+test-time augmentation), selected via --seg-source {manual,predicted}
+(default: manual).
+
+For each subject with a manual lesion label at both ses-M0 and ses-M12 under
+<data>/derivatives/labels-ms-spinal-cord-only:
+  - with --seg-source manual: the lesion volume is computed directly from
+    the manual label mask.
+  - with --seg-source predicted: the manual label path is used only to (a)
+    confirm the session exists and (b) derive the path to the corresponding
+    raw image (by dropping the "derivatives/labels-..." prefix and the
+    "_label-lesion_seg" suffix). sct_deepseg is then run on that raw image:
+
+        SCT_USE_GPU=1 sct_deepseg lesion_ms -i image.nii.gz -o output_path.nii.gz -test-time-aug
+
+    Predictions are cached under <output>/predictions/sub-X/ses-Y/anat/ and
+    are not recomputed on subsequent runs unless --overwrite-predictions is
+    passed. The lesion volume (mm3) at each timepoint is then computed from
+    the resulting predicted mask instead of the manual one.
+
+The subject is matched to its EDSS records via the SC_ID column of the EDSS
+csv (SC_ID is expected to hold the subject id without the "sub-" prefix, e.g.
+"van222" for "sub-van222"), and the EDSS sub-scores are read at the row where
 "Data Collection Point" equals "M0" / "M12".
 
 Subjects (or individual sub-X_ses-Y sessions) listed in the exclude yml file
@@ -20,22 +38,28 @@ EDSSTotal), the script correlates the delta EDSS score (M12 - M0) against
 both the absolute lesion volume change (mm3) and the percent lesion volume
 change, using Pearson and Spearman correlation.
 
-Outputs (written to --output):
-    lesion_edss_data.csv          per-subject lesion volumes, EDSS scores and deltas
-    lesion_edss_correlations.csv  correlation coefficients and p-values per EDSS column
-    plots/delta_<column>.png      scatter plot of delta lesion volume vs delta EDSS
+Outputs (written to --output), tagged with the --seg-source used:
+    predictions/sub-X/ses-Y/anat/*_pred_seg.nii.gz     predicted lesion masks (--seg-source predicted only)
+    lesion_edss_data_<seg-source>.csv                  per-subject lesion volumes, EDSS scores and deltas
+    lesion_edss_correlations_<seg-source>.csv          correlation coefficients and p-values per EDSS column
+    plots_<seg-source>/delta_<column>.png              scatter plot of delta lesion volume vs delta EDSS
 
 Arguments:
-    --data:    Path to the canproco BIDS dataset root (contains derivatives/labels-ms-spinal-cord-only)
-    --edss:    Path to the canproco EDSS.csv file
-    --exclude: Path to a yml file listing sub-X_ses-Y entries to exclude
-    --output:  Path to the output directory where results are saved
-    --no-plots: Skip generating scatter plots
+    --data:       Path to the canproco BIDS dataset root (contains derivatives/labels-ms-spinal-cord-only)
+    --edss:       Path to the canproco EDSS.csv file
+    --exclude:    Path to a yml file listing sub-X_ses-Y entries to exclude
+    --output:     Path to the output directory where results and predictions are saved
+    --seg-source: 'manual' (default) to use the manual labels, or 'predicted' to run sct_deepseg
+    --no-plots:   Skip generating scatter plots
+    --no-gpu:     Run sct_deepseg on CPU (SCT_USE_GPU=0) instead of GPU (--seg-source predicted only)
+    --overwrite-predictions: Re-run sct_deepseg even if a prediction already exists (--seg-source predicted only)
 
 Pierre-Louis Benveniste
 """
 
 import argparse
+import os
+import subprocess
 from pathlib import Path
 
 import nibabel as nib
@@ -69,8 +93,13 @@ def get_parser():
     parser.add_argument("--data", type=str, required=True, help="Path to the canproco BIDS dataset root")
     parser.add_argument("--edss", type=str, required=True, help="Path to the canproco EDSS.csv file")
     parser.add_argument("--exclude", type=str, required=True, help="Path to a yml file listing sub-X_ses-Y entries to exclude")
-    parser.add_argument("--output", type=str, required=True, help="Path to the output directory where results are saved")
+    parser.add_argument("--output", type=str, required=True, help="Path to the output directory where results and predictions are saved")
+    parser.add_argument("--seg-source", type=str, choices=["manual", "predicted"], default="manual",
+                        help="Use the manual lesion labels or run sct_deepseg to predict them (default: manual)")
     parser.add_argument("--no-plots", action="store_true", help="Skip generating scatter plots")
+    parser.add_argument("--no-gpu", action="store_true", help="Run sct_deepseg on CPU (SCT_USE_GPU=0) instead of GPU (--seg-source predicted only)")
+    parser.add_argument("--overwrite-predictions", action="store_true",
+                        help="Re-run sct_deepseg even if a prediction already exists (--seg-source predicted only)")
     return parser
 
 
@@ -103,8 +132,79 @@ def compute_lesion_volume_mm3(label_path: Path) -> float:
     return n_lesion_voxels * voxel_volume
 
 
-def collect_lesion_volumes(data_path: Path, exclude_set: set) -> pd.DataFrame:
-    """Computes M0/M12 lesion volumes for every subject with both sessions available and not excluded."""
+def derive_image_path(label_file: Path, labels_root: Path, dataset_path: Path) -> Path:
+    """Maps a derivative label file to its matching raw image path under the dataset root, by
+    dropping the derivatives/labels-... prefix and the _label-lesion_seg suffix."""
+    relative = label_file.relative_to(labels_root)
+    image_name = relative.name.replace("_label-lesion_seg.nii.gz", ".nii.gz")
+    return dataset_path / relative.parent / image_name
+
+
+def build_prediction_path(label_file: Path, labels_root: Path, predictions_root: Path) -> Path:
+    """Returns the path where the sct_deepseg prediction for a given manual label file is stored."""
+    relative = label_file.relative_to(labels_root)
+    pred_name = relative.name.replace("_label-lesion_seg.nii.gz", "_pred_seg.nii.gz")
+    return predictions_root / relative.parent / pred_name
+
+
+def run_sct_deepseg_prediction(image_path: Path, output_path: Path, use_gpu: bool, overwrite: bool) -> bool:
+    """Runs sct_deepseg lesion_ms (with test-time augmentation) on image_path, writing to output_path.
+    Skips running if output_path already exists and overwrite is False. Returns True on success."""
+    if output_path.exists() and not overwrite:
+        logger.info(f"Prediction already exists, skipping: {output_path}")
+        return True
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    env = os.environ.copy()
+    env["SCT_USE_GPU"] = "1" if use_gpu else "0"
+    cmd = ["sct_deepseg", "lesion_ms", "-i", str(image_path), "-o", str(output_path), "-test-time-aug"]
+
+    logger.info(f"Running (SCT_USE_GPU={env['SCT_USE_GPU']}): {' '.join(cmd)}")
+    result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    if result.returncode != 0:
+        logger.error(f"sct_deepseg failed for {image_path}:\n{result.stderr}")
+        return False
+    if not output_path.exists():
+        logger.error(f"sct_deepseg reported success but no output was found at {output_path}")
+        return False
+    return True
+
+
+def get_segmentation_files(
+    subject_id: str, label_files: dict, labels_root: Path, data_path: Path,
+    seg_source: str, predictions_root: Path, use_gpu: bool, overwrite: bool,
+) -> dict:
+    """Returns {ses: Path} to the mask to compute lesion volume from, for each session, according
+    to seg_source. For 'manual' this is just the label files. For 'predicted', the raw image is
+    located from the label file and sct_deepseg is run (or its cached output reused). Returns None
+    if any session's mask could not be obtained (missing image, or a failed prediction)."""
+    if seg_source == "manual":
+        return dict(label_files)
+
+    seg_files = {}
+    for ses in SESSIONS:
+        image_path = derive_image_path(label_files[ses], labels_root, data_path)
+        if not image_path.exists():
+            logger.warning(f"{subject_id}: raw image not found at {image_path}, skipping")
+            return None
+
+        pred_path = build_prediction_path(label_files[ses], labels_root, predictions_root)
+        if not run_sct_deepseg_prediction(image_path, pred_path, use_gpu, overwrite):
+            logger.warning(f"{subject_id}: prediction failed for {ses}, skipping")
+            return None
+
+        seg_files[ses] = pred_path
+
+    return seg_files
+
+
+def collect_lesion_volumes(
+    data_path: Path, exclude_set: set, seg_source: str,
+    predictions_root: Path = None, use_gpu: bool = True, overwrite: bool = False,
+) -> pd.DataFrame:
+    """Computes M0/M12 lesion volumes for every subject with both sessions available and not
+    excluded, from either the manual labels or sct_deepseg predictions (see seg_source)."""
     labels_root = data_path / "derivatives" / "labels-ms-spinal-cord-only"
     if not labels_root.exists():
         raise FileNotFoundError(f"Labels folder not found: {labels_root}")
@@ -125,8 +225,14 @@ def collect_lesion_volumes(data_path: Path, exclude_set: set) -> pd.DataFrame:
             logger.warning(f"{subject_id}: missing lesion label for {missing}, skipping")
             continue
 
-        volume_m0 = compute_lesion_volume_mm3(label_files["ses-M0"])
-        volume_m12 = compute_lesion_volume_mm3(label_files["ses-M12"])
+        seg_files = get_segmentation_files(
+            subject_id, label_files, labels_root, data_path, seg_source, predictions_root, use_gpu, overwrite
+        )
+        if seg_files is None:
+            continue
+
+        volume_m0 = compute_lesion_volume_mm3(seg_files["ses-M0"])
+        volume_m12 = compute_lesion_volume_mm3(seg_files["ses-M12"])
         delta_volume = volume_m12 - volume_m0
         pct_change = (delta_volume / volume_m0 * 100) if volume_m0 > 0 else np.nan
 
@@ -216,13 +322,12 @@ def compute_correlations(merged_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(results)
 
 
-def plot_correlations(merged_df: pd.DataFrame, output_dir: Path):
+def plot_correlations(merged_df: pd.DataFrame, plots_dir: Path):
     """Saves a scatter plot of delta lesion volume (mm3) vs delta EDSS for each EDSS column."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    plots_dir = output_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
 
     volume_metric = "delta_lesion_volume_mm3"
@@ -259,7 +364,12 @@ def main():
     exclude_set = load_exclude_set(args.exclude)
     logger.info(f"Loaded {len(exclude_set)} exclude entries from {args.exclude}")
 
-    lesion_df = collect_lesion_volumes(data_path, exclude_set)
+    logger.info(f"Using --seg-source={args.seg_source} lesion segmentations")
+    predictions_root = output_path / "predictions"
+    lesion_df = collect_lesion_volumes(
+        data_path, exclude_set, args.seg_source,
+        predictions_root=predictions_root, use_gpu=not args.no_gpu, overwrite=args.overwrite_predictions,
+    )
     if lesion_df.empty:
         logger.error("No subjects with lesion volumes at both M0 and M12 were found, exiting")
         return
@@ -267,18 +377,18 @@ def main():
     edss_df = load_edss(args.edss)
     merged_df = collect_edss_deltas(lesion_df, edss_df)
 
-    data_csv = output_path / "lesion_edss_data.csv"
+    data_csv = output_path / f"lesion_edss_data_{args.seg_source}.csv"
     merged_df.to_csv(data_csv, index=False)
     logger.info(f"Saved per-subject lesion/EDSS data to {data_csv}")
 
     correlations_df = compute_correlations(merged_df)
-    correlations_csv = output_path / "lesion_edss_correlations.csv"
+    correlations_csv = output_path / f"lesion_edss_correlations_{args.seg_source}.csv"
     correlations_df.to_csv(correlations_csv, index=False)
     logger.info(f"Saved correlation results to {correlations_csv}")
     logger.info("Correlation summary:\n" + correlations_df.to_string(index=False))
 
     if not args.no_plots:
-        plot_correlations(merged_df, output_path)
+        plot_correlations(merged_df, output_path / f"plots_{args.seg_source}")
 
 
 if __name__ == "__main__":
